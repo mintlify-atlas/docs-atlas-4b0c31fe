@@ -1,0 +1,242 @@
+---
+title: YAML configuration schema
+description: Complete reference for the pipeline YAML configuration file
+---
+
+The pipeline configuration is defined in a YAML file (typically `configs/pipeline.yaml`) that controls all aspects of experiment execution, including repository locations, LLM endpoints, OpenHands settings, and execution modes.
+
+## Configuration file location
+
+Configuration files are typically stored in the `configs/` directory:
+
+```bash
+configs/pipeline.yaml
+```
+
+The configuration is loaded using:
+
+```python
+from pathlib import Path
+from atd_pipeline.config import PipelineConfig
+
+config = PipelineConfig.load(
+    Path("configs/pipeline.yaml"),
+    repo_root=Path.cwd()
+)
+```
+
+## Complete example
+
+```yaml
+projects_dir: projects_to_analyze
+repos_file: repos.txt
+cycles_file: cycles_to_analyze.txt
+results_root: results
+experiment_id: expTestAAA
+
+policy:
+  delete_refactor_branches_after_metrics: true
+
+llm:
+  base_url: "http://host.docker.internal:8012/v1"
+  api_key: "placeholder"
+  model_raw: "Qwen3-Coder-30B-A3B-Instruct"
+  context_length: 32768
+
+openhands:
+  runtime_image: "docker.openhands.dev/openhands/runtime:1.4-nikolaik"
+  max_iters: 150
+  commit_message: "Refactor: break dependency cycle"
+
+modes:
+  - id: explain_E0_S0_noaux
+    params:
+      orchestrator: multi_agent
+      edge_variant: E0
+      synthesizer_variant: S0
+      auxiliary_agent: none
+
+  - id: explain_E1_S0_boundary
+    params:
+      orchestrator: multi_agent
+      edge_variant: E1
+      synthesizer_variant: S0
+      auxiliary_agent: boundary
+
+  - id: no_explain
+    params:
+      orchestrator: minimal
+```
+
+## Root fields
+
+<ParamField path="projects_dir" type="string" required>
+  Directory containing the repositories to analyze. All subject systems must be cloned into this directory before running experiments.
+  
+  **Example:** `projects_to_analyze`
+</ParamField>
+
+<ParamField path="repos_file" type="string" required>
+  Path to the file listing repositories to analyze. Each line contains: `repo_name base_branch entry_dir language`.
+  
+  **Example:** `repos.txt`
+</ParamField>
+
+<ParamField path="cycles_file" type="string" required>
+  Path to the file listing dependency cycles to refactor. Generated automatically using `scripts/build_cycles_to_analyze.sh`.
+  
+  **Example:** `cycles_to_analyze.txt`
+</ParamField>
+
+<ParamField path="results_root" type="string" required>
+  Root directory where all experimental outputs are stored, including LLM transcripts, OpenHands logs, patches, and metrics.
+  
+  **Example:** `results`
+</ParamField>
+
+<ParamField path="experiment_id" type="string" required>
+  Unique identifier for this experiment run. Used to organize results and prevent conflicts between different experiments.
+  
+  **Example:** `expTestAAA`
+</ParamField>
+
+## Policy configuration
+
+The `policy` section controls pipeline behavior and cleanup policies.
+
+<ParamField path="policy.delete_refactor_branches_after_metrics" type="boolean" required>
+  Whether to delete local refactoring branches after metrics collection completes. Set to `true` to save disk space, or `false` to preserve branches for inspection.
+  
+  **Default:** Not specified (must be explicitly set)
+</ParamField>
+
+## LLM configuration
+
+See [LLM endpoint configuration](/api/config/llm-config) for detailed documentation.
+
+<ParamField path="llm" type="object" required>
+  Configuration for the LLM endpoint used by both the explanation agents and OpenHands.
+</ParamField>
+
+## OpenHands configuration
+
+See [OpenHands integration configuration](/api/config/openhands-config) for detailed documentation.
+
+<ParamField path="openhands" type="object" required>
+  Configuration for OpenHands execution, including Docker runtime image and iteration limits.
+</ParamField>
+
+## Execution modes
+
+<ParamField path="modes" type="array" required>
+  List of execution modes defining different agent configurations and orchestration strategies. Each mode represents a unique experimental condition.
+</ParamField>
+
+### Mode specification
+
+Each mode in the `modes` array has the following structure:
+
+<ParamField path="modes[].id" type="string" required>
+  Unique identifier for this mode. Used in command-line arguments and result directories.
+  
+  **Example:** `explain_E0_S0_noaux`
+</ParamField>
+
+<ParamField path="modes[].params" type="object" required>
+  Parameters controlling agent behavior and orchestration strategy for this mode.
+</ParamField>
+
+### Mode parameters
+
+<ParamField path="modes[].params.orchestrator" type="string" default="multi_agent">
+  Orchestration strategy for cycle explanation.
+  
+  **Options:**
+  - `multi_agent` - Use multi-agent team with specialized roles
+  - `minimal` - Skip explanation phase entirely
+</ParamField>
+
+<ParamField path="modes[].params.edge_variant" type="string">
+  Edge detection variant for dependency analysis. Required when `orchestrator` is `multi_agent`.
+  
+  **Options:** `E0`, `E1`, `E2`
+  
+  **Example:** `E0`
+</ParamField>
+
+<ParamField path="modes[].params.synthesizer_variant" type="string">
+  Synthesizer variant for combining agent outputs. Required when `orchestrator` is `multi_agent`.
+  
+  **Options:** `S0`, `S1`, `S2`
+  
+  **Example:** `S0`
+</ParamField>
+
+<ParamField path="modes[].params.auxiliary_agent" type="string" default="none">
+  Auxiliary agent to include in the multi-agent team. Only one auxiliary agent can be specified per mode.
+  
+  **Options:**
+  - `none` - No auxiliary agent
+  - `boundary` - Boundary analysis agent
+  - `graph` - Graph analysis agent
+  - `review` - Review agent
+  
+  **Example:** `none`
+</ParamField>
+
+<Note>
+  The `edge_variant` and `synthesizer_variant` parameters are only meaningful when `orchestrator` is set to `multi_agent`. They are ignored for minimal orchestration.
+</Note>
+
+## Validation rules
+
+The configuration loader enforces the following validation rules:
+
+1. All file paths are resolved relative to the repository root
+2. Required string fields must be non-empty after trimming whitespace
+3. Integer fields must be positive integers
+4. The `policy`, `llm`, `openhands`, and `modes` sections are all required
+5. The `modes` array must contain at least one mode
+6. Each mode must have a unique `id`
+7. Mode parameters must match the allowed values for each field
+8. Auxiliary agent must be a single string value, not a list
+
+## Error handling
+
+Configuration errors are reported with descriptive messages indicating:
+- The specific field that failed validation
+- The path to the field (e.g., `llm.base_url`, `modes[0].params.orchestrator`)
+- The expected type or format
+- The actual value received (when applicable)
+
+<Warning>
+  The configuration loader will terminate with a `ValueError` if any validation rules are violated. Ensure all required fields are present and correctly formatted before running experiments.
+</Warning>
+
+## Related
+
+- [LLM endpoint configuration](/api/config/llm-config)
+- [OpenHands integration configuration](/api/config/openhands-config)
+- [PipelineConfig class](/api/config/yaml-schema#pipelineconfig-class)
+
+## PipelineConfig class
+
+The configuration is loaded into a `PipelineConfig` dataclass defined in `/home/daytona/workspace/source/atd_pipeline/config.py:88-170`:
+
+```python
+@dataclass(frozen=True)
+class PipelineConfig:
+    projects_dir: Path
+    repos_file: Path
+    cycles_file: Path
+    results_root: Path
+    experiment_id: str
+
+    policy: PolicyConfig
+    llm: LLMConfig
+    openhands: OpenHandsConfig
+
+    modes: List[ModeSpec]
+```
+
+All path fields are resolved to absolute paths during loading using `Path.resolve()`.

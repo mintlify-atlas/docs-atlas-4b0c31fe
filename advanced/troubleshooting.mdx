@@ -1,0 +1,669 @@
+---
+title: Troubleshooting
+description: Common issues, error messages, and solutions for pipeline execution problems
+---
+
+This page covers common issues encountered when running the pipeline, along with diagnostic steps and solutions.
+
+## LLM connection issues
+
+### Connection refused to LLM endpoint
+
+**Symptoms:**
+- Error: `Connection refused to http://host.docker.internal:8012/v1`
+- Pipeline fails during explanation or refactoring phase
+- `explain_status.json` shows connection error
+
+**Causes:**
+1. LLM server not running
+2. Incorrect `base_url` in `pipeline.yaml`
+3. Docker network misconfiguration
+
+**Solutions:**
+
+<Accordion title="Verify LLM server is running">
+```bash
+# Check if server is listening (outside container)
+curl http://localhost:8012/v1/models
+
+# Should return JSON with model list
+```
+
+If not running, start your LLM server:
+```bash
+# Example for vLLM
+python -m vllm.entrypoints.openai.api_server \
+  --model /path/to/model \
+  --port 8012
+```
+</Accordion>
+
+<Accordion title="Check Docker host networking">
+From inside the container:
+```bash
+# Test connectivity
+curl http://host.docker.internal:8012/v1/models
+```
+
+If this fails but `localhost:8012` works on the host, the issue is Docker networking.
+
+**Fix:** Ensure `--add-host=host.docker.internal:host-gateway` is in your `docker run` command.
+</Accordion>
+
+<Accordion title="Verify pipeline.yaml configuration">
+```yaml
+llm:
+  base_url: "http://host.docker.internal:8012/v1"  # Must end with /v1
+  api_key: "placeholder"  # Any non-empty string
+  model_raw: "/path/to/model"  # Model identifier
+```
+
+Common mistakes:
+- Missing `/v1` suffix
+- Using `localhost` instead of `host.docker.internal`
+- Incorrect port number
+</Accordion>
+
+### LLM server timeout
+
+**Symptoms:**
+- Pipeline hangs during LLM calls
+- Eventually times out with no response
+
+**Causes:**
+1. Model too large for available GPU memory
+2. Context length exceeded
+3. Server overloaded
+
+**Solutions:**
+
+```bash
+# Check GPU memory usage
+nvidia-smi
+
+# Check LLM server logs for errors
+# (location depends on your LLM server setup)
+```
+
+**Reduce context pressure:**
+- Use smaller cycles (adjust `--max-size` in `build_cycles_to_analyze.sh`)
+- Reduce edge count per cycle
+- Use a model with larger context window
+
+## Configuration errors
+
+### Invalid orchestrator value
+
+**Error message:**
+```
+ValueError: orchestrator must be 'minimal' or 'multi_agent'
+```
+
+**Cause:** Typo or invalid value in mode configuration.
+
+**Solution:**
+```yaml
+modes:
+  - id: my_mode
+    params:
+      orchestrator: multi_agent  # Must be exactly "minimal" or "multi_agent"
+```
+
+### Invalid agent variant
+
+**Error messages:**
+```
+ValueError: edge_variant must be one of ['E0', 'E1', 'E2'] (got 'E3')
+ValueError: synthesizer_variant must be one of ['S0', 'S1', 'S2'] (got 'S3')
+ValueError: auxiliary_agent must be one of none|boundary|graph|review (got 'invalid')
+```
+
+**Cause:** Invalid variant ID in configuration.
+
+**Solution:** Use only valid variant IDs (case-sensitive):
+- Edge variants: `E0`, `E1`, `E2`
+- Synthesizer variants: `S0`, `S1`, `S2`
+- Auxiliary agents: `none`, `boundary`, `graph`, `review`
+
+```yaml
+params:
+  orchestrator: multi_agent
+  edge_variant: E0      # Case-sensitive
+  synthesizer_variant: S0
+  auxiliary_agent: none  # Lowercase
+```
+
+### Missing required parameters
+
+**Error message:**
+```
+KeyError: 'orchestrator'
+```
+
+**Cause:** Mode configuration missing required `orchestrator` parameter.
+
+**Solution:**
+```yaml
+modes:
+  - id: my_mode
+    params:
+      orchestrator: multi_agent  # Required for all modes
+      # other params...
+```
+
+## Baseline phase failures
+
+### Dependency analysis fails
+
+**Symptoms:**
+- `run_baseline.sh` exits with error
+- `dependency_graph.json` not created
+- Error mentions missing Python/C# analyzer
+
+**Solutions:**
+
+<Accordion title="Python projects">
+**Check Python environment:**
+```bash
+# Inside container
+python3 --version
+pip list | grep pydeps
+```
+
+**Verify repos.txt language field:**
+```
+project_name,main,.,python  # Must be "python" (lowercase)
+```
+
+**Check entry directory:**
+Ensure the 4th field in `repos.txt` points to a directory containing `.py` files.
+</Accordion>
+
+<Accordion title="C# projects">
+**Check .NET SDK:**
+```bash
+# Inside container
+dotnet --version
+```
+
+**Verify repos.txt language field:**
+```
+project_name,main,.,csharp  # Must be "csharp" (lowercase)
+```
+
+**Check for .csproj or .sln:**
+C# analysis requires a valid .NET project structure.
+</Accordion>
+
+### SCC computation fails
+
+**Symptoms:**
+- `dependency_graph.json` exists but `scc_report.json` is missing
+- Error during SCC analysis step
+
+**Cause:** Usually indicates corrupted or malformed dependency graph.
+
+**Diagnostic:**
+```bash
+# Validate dependency_graph.json
+cat results/expA/myproject/main/baseline/dependency_graph.json | jq .
+
+# Check for empty nodes/edges
+jq '.nodes | length' results/expA/myproject/main/baseline/dependency_graph.json
+jq '.edges | length' results/expA/myproject/main/baseline/dependency_graph.json
+```
+
+**Solution:** Re-run baseline with clean state:
+```bash
+rm -rf results/expA/myproject/main/baseline/
+scripts/run_baseline.sh -c configs/pipeline.yaml
+```
+
+## Cycle selection issues
+
+### No cycles found
+
+**Symptoms:**
+- `cycles_to_analyze.txt` is empty or has fewer cycles than expected
+- `build_cycles_to_analyze.sh` reports 0 eligible cycles
+
+**Causes:**
+1. No SCCs in the project (no dependency cycles exist)
+2. Size filters too restrictive
+3. Baseline phase incomplete
+
+**Solutions:**
+
+<Accordion title="Check SCC report">
+```bash
+# Count SCCs in baseline
+jq '.sccs | length' results/expA/myproject/main/baseline/scc_report.json
+
+# List SCC sizes
+jq '.sccs[] | {id: .id, size: (.nodes | length)}' \
+  results/expA/myproject/main/baseline/scc_report.json
+```
+
+If no SCCs exist, the project has no dependency cycles.
+</Accordion>
+
+<Accordion title="Adjust size filters">
+```bash
+# Default filters
+scripts/build_cycles_to_analyze.sh -c configs/pipeline.yaml \
+  --total 100 \
+  --min-size 2 \
+  --max-size 8 \
+  --out cycles_to_analyze.txt
+
+# Relaxed filters (allow larger cycles)
+scripts/build_cycles_to_analyze.sh -c configs/pipeline.yaml \
+  --total 100 \
+  --min-size 2 \
+  --max-size 20 \  # Increased
+  --out cycles_to_analyze.txt
+```
+</Accordion>
+
+### Cycle IDs not found
+
+**Error message:**
+```
+Cycle scc_3_cycle_17 not found in catalog
+```
+
+**Cause:** `cycles_to_analyze.txt` contains cycle IDs that don't exist in `cycle_catalog.json`.
+
+**Solution:** Regenerate `cycles_to_analyze.txt`:
+```bash
+scripts/build_cycles_to_analyze.sh -c configs/pipeline.yaml \
+  --total 100 \
+  --min-size 2 \
+  --max-size 8 \
+  --out cycles_to_analyze.txt
+```
+
+<Warning>
+Do NOT manually edit `cycles_to_analyze.txt` unless you're certain the cycle IDs exist in the baseline catalog.
+</Warning>
+
+## OpenHands execution failures
+
+### Docker-in-Docker issues
+
+**Symptoms:**
+- OpenHands fails to start
+- Error: `Cannot connect to the Docker daemon`
+- Container cannot launch nested containers
+
+**Causes:**
+1. Docker socket not mounted
+2. Incorrect permissions on `/var/run/docker.sock`
+3. Missing `--group-add` for Docker group
+
+**Solution:**
+
+Verify `docker run` command includes:
+```bash
+DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)
+
+docker run --rm -it \
+  -v /var/run/docker.sock:/var/run/docker.sock \  # Mount socket
+  --group-add "$DOCKER_GID" \                     # Add Docker group
+  # ... other flags
+  atd-dev
+```
+
+Test from inside container:
+```bash
+docker ps  # Should list running containers
+```
+
+### OpenHands image pull fails
+
+**Symptoms:**
+- Error: `Failed to pull image docker.all-hands.dev/all-hands-ai/openhands:0.59`
+- OpenHands execution aborts
+
+**Solution:**
+
+Pre-pull images on the host before running experiments:
+```bash
+# Pull OpenHands images (outside container)
+docker pull docker.all-hands.dev/all-hands-ai/openhands:0.59
+docker pull docker.all-hands.dev/all-hands-ai/runtime:0.59-nikolaik
+```
+
+Verify in `pipeline.yaml`:
+```yaml
+openhands:
+  image: "docker.all-hands.dev/all-hands-ai/openhands:0.59"
+  runtime_image: "docker.all-hands.dev/all-hands-ai/runtime:0.59-nikolaik"
+```
+
+### Refactoring hits iteration limit
+
+**Symptoms:**
+- `refactor_status.json` shows `max_iterations_reached`
+- OpenHands stops without completing refactoring
+- Trajectory shows repetitive actions
+
+**Cause:** Cycle is too complex or OpenHands is stuck in a loop.
+
+**Solutions:**
+
+1. **Increase iteration limit:**
+```yaml
+openhands:
+  max_iters: 150  # Increased from 100
+```
+
+2. **Select smaller cycles:**
+```bash
+scripts/build_cycles_to_analyze.sh -c configs/pipeline.yaml \
+  --total 100 \
+  --min-size 2 \
+  --max-size 5 \  # Reduced from 8
+  --out cycles_to_analyze.txt
+```
+
+3. **Use prescriptive modes:**
+```yaml
+modes:
+  - id: prescriptive
+    params:
+      orchestrator: multi_agent
+      edge_variant: E0
+      synthesizer_variant: S1  # Provides concrete plan
+      auxiliary_agent: none
+```
+
+### Tests fail after refactoring
+
+**Symptoms:**
+- `test_results.json` shows failures
+- Refactoring introduced regressions
+
+**This is expected behavior** - not all refactorings succeed. The pipeline records test results for analysis.
+
+**Analysis:**
+```bash
+# View test output
+cat results/expA/myproject/main/explain_E0_S0_noaux/scc_3_cycle_17/test_results.json
+
+# Check what changed
+cat results/expA/myproject/main/explain_E0_S0_noaux/scc_3_cycle_17/patch.diff
+```
+
+**Metrics:**
+Count test pass rates across modes to measure refactoring quality.
+
+## Resume and interrupted runs
+
+### Detecting interrupted runs
+
+**Symptoms:**
+- Pipeline was interrupted (SSH disconnect, Ctrl+C, GPU job terminated)
+- Uncertain which cycles completed
+
+**Diagnostic:**
+```bash
+# Find incomplete cycles
+find results/expA/myproject/main/explain_E0_S0_noaux/ \
+  -name "explain_status.json" \
+  -exec grep -L '"status": "complete"' {} \;
+
+# Find blocked units
+find results/expA/myproject/main/ \
+  -name "*_status.json" \
+  -exec grep -l '"status": "blocked"' {} \;
+```
+
+### Resuming safely
+
+The pipeline supports automatic resume:
+
+```bash
+# Re-run LLM phase (skips completed, retries blocked)
+scripts/run_llm.sh -c configs/pipeline.yaml --modes explain_E0_S0_noaux
+
+# Re-run metrics phase
+scripts/run_metrics.sh -c configs/pipeline.yaml --modes explain_E0_S0_noaux
+```
+
+**Resume behavior:**
+- **Completed cycles** (`status: complete`): Skipped
+- **Blocked cycles** (`status: blocked`): Re-executed from scratch
+- **Partial cycles** (incomplete files): Cleaned and re-executed
+
+<Note>
+The pipeline never re-runs completed work. Partial progress is always discarded to ensure consistency.
+</Note>
+
+### Manual cleanup after corruption
+
+If results are corrupted:
+
+```bash
+# Remove specific cycle
+rm -rf results/expA/myproject/main/explain_E0_S0_noaux/scc_3_cycle_17/
+
+# Remove entire mode (re-run all cycles)
+rm -rf results/expA/myproject/main/explain_E0_S0_noaux/
+
+# Re-run
+scripts/run_llm.sh -c configs/pipeline.yaml --modes explain_E0_S0_noaux
+```
+
+<Warning>
+Always back up your `results/` directory before manual cleanup operations.
+</Warning>
+
+## Smoke testing
+
+The repository includes automated smoke tests that validate fault tolerance and resume behavior.
+
+### Running smoke tests
+
+```bash
+# From repository root, inside container
+bash test_runs/cases/ok_smoke_realish/run.sh
+bash test_runs/cases/ok_smoke_resume_explain_llm/run.sh
+bash test_runs/cases/ok_smoke_resume_openhands_llm/run.sh
+bash test_runs/cases/ok_smoke_fail_early_openhands_llm/run.sh
+```
+
+### Test scenarios
+
+<Accordion title="ok_smoke_realish: Baseline smoke test">
+**Purpose:** Validates full pipeline execution under normal conditions.
+
+**What it tests:**
+- Baseline phase completes
+- Cycle selection works
+- LLM explanation succeeds
+- OpenHands refactoring runs
+- Metrics collection works
+
+**Expected outcome:** All phases complete successfully.
+
+**Use case:** Verify basic infrastructure is working.
+</Accordion>
+
+<Accordion title="ok_smoke_resume_explain_llm: Resume after explanation failure">
+**Purpose:** Simulates LLM failure during explanation phase.
+
+**What it tests:**
+- Interrupted explanations are detected
+- Blocked cycles are recorded
+- Resume skips completed cycles
+- Resume re-executes blocked cycles
+
+**How it works:**
+1. Start fake LLM server
+2. Run explanation phase
+3. Server terminates mid-run
+4. Verify blocked state
+5. Restart server
+6. Resume and verify completion
+
+**Expected outcome:** Resume completes missing work without re-running completed cycles.
+</Accordion>
+
+<Accordion title="ok_smoke_resume_openhands_llm: Resume after OpenHands failure">
+**Purpose:** Simulates LLM failure during OpenHands refactoring.
+
+**What it tests:**
+- Blocked refactoring units are detected
+- Resume continues from failure point
+- Completed cycles are not re-run
+
+**How it works:**
+1. Run explanation phase (completes)
+2. Start refactoring phase
+3. LLM server terminates during OpenHands execution
+4. Verify blocked state
+5. Resume and verify completion
+
+**Expected outcome:** Resume picks up where it left off.
+</Accordion>
+
+<Accordion title="ok_smoke_fail_early_openhands_llm: Fail-fast behavior">
+**Purpose:** Validates early termination on first failure.
+
+**What it tests:**
+- First blocked unit is detected
+- Remaining units are skipped (fail-fast)
+- Resume recovers only missing work
+
+**How it works:**
+1. Run with LLM server configured to fail on first OpenHands request
+2. Verify only first cycle attempted
+3. Restart server
+4. Resume and complete all cycles
+
+**Expected outcome:** Fail-fast on first error, full recovery on resume.
+</Accordion>
+
+### Interpreting smoke test results
+
+From `test_runs/README.md:209-217`:
+
+<Note>
+The smoke tests demonstrate that:
+- Partial progress is discarded correctly
+- Resume avoids redundant recomputation
+- Interrupted runs can be continued safely
+- Final metrics remain consistent
+</Note>
+
+If smoke tests fail, the pipeline's resume mechanism may be broken - file an issue.
+
+## File system issues
+
+### Permission errors
+
+**Symptoms:**
+- `Permission denied` when writing results
+- Files owned by root instead of your user
+
+**Cause:** Container running as wrong user.
+
+**Solution:**
+
+Ensure `docker run` includes:
+```bash
+docker run --rm -it \
+  --user "$(id -u):$(id -g)" \  # Run as current user
+  # ... other flags
+  atd-dev
+```
+
+Fix existing permissions:
+```bash
+# Outside container
+sudo chown -R $(id -u):$(id -g) results/
+```
+
+### Disk space exhausted
+
+**Symptoms:**
+- Error: `No space left on device`
+- Results directory very large
+
+**Solutions:**
+
+```bash
+# Check disk usage
+du -sh results/
+df -h .
+
+# Remove OpenHands workspaces (keep patches)
+find results/ -type d -name "openhands_workspace" -exec rm -rf {} +
+
+# Compress old experiments
+tar -czf results_expA_backup.tar.gz results/expA/
+rm -rf results/expA/
+```
+
+### WSL-specific issues (Windows)
+
+**Symptoms:**
+- Very slow file I/O
+- Permission issues
+- Docker performance problems
+
+**Solution:**
+
+Ensure repository is stored in WSL filesystem, NOT Windows filesystem:
+
+```bash
+# Good: WSL filesystem
+/home/username/workspace/atd-pipeline/
+
+# Bad: Windows filesystem (slow!)
+/mnt/c/Users/username/Desktop/atd-pipeline/
+```
+
+Move to WSL if needed:
+```bash
+cp -r /mnt/c/Users/username/Desktop/atd-pipeline ~/workspace/
+cd ~/workspace/atd-pipeline/
+```
+
+## Getting help
+
+If you encounter issues not covered here:
+
+1. **Check logs:**
+   - `transcript.txt` for LLM errors
+   - `openhands_logs/` for refactoring failures
+   - `status.json` files for execution state
+
+2. **Verify configuration:**
+   - `pipeline.yaml` syntax
+   - `repos.txt` format
+   - Mode parameter validity
+
+3. **Run smoke tests:**
+   - Validates basic infrastructure
+   - Tests resume behavior
+
+4. **Minimal reproduction:**
+   - Test with single cycle
+   - Use simplest mode configuration
+   - Isolate the failing component
+
+5. **Collect diagnostics:**
+   ```bash
+   # Capture full logs
+   scripts/run_llm.sh -c configs/pipeline.yaml --modes my_mode 2>&1 | tee debug.log
+   ```
+
+<Tip>
+When reporting issues, include:
+- Pipeline configuration (`pipeline.yaml`)
+- Error messages from logs
+- Docker and Python versions
+- Operating system (WSL version if on Windows)
+</Tip>

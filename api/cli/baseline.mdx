@@ -1,0 +1,109 @@
+---
+title: baseline
+description: Collect baseline metrics for all configured repositories
+---
+
+Collects baseline metrics and identifies ATD (Architectural Technical Debt) for all repositories specified in the configuration file. This command must be run before any LLM-based refactoring phases.
+
+## Usage
+
+```bash
+python3 -m atd_pipeline.cli baseline -c <config_file>
+```
+
+Or using the wrapper script:
+
+```bash
+scripts/run_baseline.sh -c pipeline.yaml
+```
+
+## Parameters
+
+<ParamField path="config" type="Path" required>
+  Path to the pipeline configuration YAML file. This file must exist and contain repository definitions.
+  
+  **Flags:** `-c`, `--config`
+  
+  **Example:** `-c pipeline.yaml`
+</ParamField>
+
+## What it does
+
+For each repository in the configuration, the baseline command:
+
+1. **Checks out the base branch** - Switches to the baseline branch specified in the config
+2. **Extracts dependency graph** - Analyzes code structure and dependencies
+3. **Identifies strongly connected components (SCCs)** - Detects circular dependencies
+4. **Generates SCC report** - Creates `scc_report.json` with cycle metrics
+5. **Collects code quality metrics** - Runs linters and quality tools
+6. **Creates quality summary** - Aggregates metrics into `metrics.json`
+
+## Output structure
+
+Results are written to:
+
+```
+<results_root>/<repo_name>/<base_branch>/
+├── ATD_identification/
+│   ├── dependency_graph.json
+│   ├── scc_report.json
+│   └── cycle_catalog.json
+├── code_quality_checks/
+│   ├── metrics.json
+│   └── [various quality reports]
+└── _phase_baseline.json
+```
+
+## Examples
+
+<CodeGroup>
+
+```bash Default configuration
+python3 -m atd_pipeline.cli baseline -c pipeline.yaml
+```
+
+```bash Custom configuration
+python3 -m atd_pipeline.cli baseline -c experiments/custom_config.yaml
+```
+
+```bash Using wrapper script
+scripts/run_baseline.sh -c pipeline.yaml
+```
+
+</CodeGroup>
+
+## Status tracking
+
+The command writes phase status to `_phase_baseline.json` with:
+
+- **execution_id** - Unique run identifier
+- **outcome** - `started`, `ok`, or `failed`
+- **returncode** - Exit code from baseline collection script
+- **duration_sec** - Execution time
+- **cmd** - Full command that was executed
+
+## Prerequisites
+
+- Valid pipeline configuration file
+- Repositories cloned to `projects_dir`
+- Base branch exists in each repository
+- Language-specific tools installed:
+  - Python: AST analyzers, pylint, radon
+  - C#: Roslyn analyzers, dotnet tools
+
+<Note>
+Baseline must complete successfully before running `explain`, `openhands`, or `llm` commands.
+</Note>
+
+## Error handling
+
+If baseline collection fails for a repository:
+
+- Status is marked as `failed` with reason
+- Execution continues to remaining repositories
+- Check `_phase_baseline.json` for error details
+- Verify repository checkout and tool installation
+
+## Implementation
+
+See `atd_pipeline/cli.py:356` for the baseline command implementation.

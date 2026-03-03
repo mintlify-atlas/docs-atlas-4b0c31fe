@@ -1,0 +1,508 @@
+---
+title: Custom modes
+description: Creating custom experimental modes by configuring orchestrators, agent variants, and parameters
+---
+
+Experimental **modes** define how the pipeline generates cycle explanations. Each mode is a named configuration that specifies the orchestration strategy, agent variants, and auxiliary context providers.
+
+Modes are defined in your `pipeline.yaml` configuration file and can be mixed and matched to run comparative experiments.
+
+## Mode structure
+
+Each mode consists of:
+- **`id`**: Unique identifier for the mode (used in results directory structure)
+- **`params`**: Dictionary of configuration parameters controlling agent behavior
+
+### Basic example
+
+```yaml
+modes:
+  - id: baseline_minimal
+    params:
+      orchestrator: minimal
+
+  - id: explain_multiagent
+    params:
+      orchestrator: multi_agent
+      edge_variant: E0
+      synthesizer_variant: S0
+      auxiliary_agent: none
+```
+
+## Orchestrator types
+
+The `orchestrator` parameter controls the high-level explanation strategy.
+
+### minimal: No LLM explanation
+
+**Purpose:** Generates a minimal prompt containing only the cycle structure without LLM-based analysis.
+
+**Use case:** Baseline experiments where the refactoring agent receives no architectural guidance.
+
+**Parameters:**
+- `orchestrator: minimal` (required)
+- No other parameters used
+
+**Source:** `explain_AS/engine.py:90-93`
+
+**Output:**
+- `prompt.txt` contains only the minimal base prompt with cycle nodes
+- No LLM calls are made during explanation phase
+- No `transcript.txt` or usage files
+
+**Example:**
+```yaml
+modes:
+  - id: no_explain
+    params:
+      orchestrator: minimal
+```
+
+<Note>
+The minimal orchestrator is useful for control groups in experiments measuring the impact of LLM-generated explanations on refactoring success rates.
+</Note>
+
+### multi_agent: Full multi-agent explanation
+
+**Purpose:** Uses a team of specialized agents to analyze the cycle and produce a comprehensive explanation.
+
+**Parameters:**
+- `orchestrator: multi_agent` (required)
+- `edge_variant`: Edge agent variant (E0, E1, E2) - defaults to E0
+- `synthesizer_variant`: Synthesizer agent variant (S0, S1, S2) - defaults to S0
+- `auxiliary_agent`: Auxiliary context provider (none, boundary, graph, review) - defaults to none
+
+**Source:** `explain_AS/engine.py:96-208`
+
+**Agent execution order:**
+1. **Edge agents** analyze each edge in the cycle
+2. **Auxiliary agent** (if configured) provides additional context
+3. **Synthesizer agent** combines edge reports and auxiliary context
+4. **Review agent** (if `auxiliary_agent: review`) rewrites synthesizer output
+
+**Output policy** (from `engine.py:107-112`):
+- `prompt.txt` contains ONLY:
+  - The minimal base prompt
+  - The final cycle-level explanation (synthesizer or reviewer output)
+- `transcript.txt` contains all agent interactions
+- Edge reports and auxiliary outputs are NOT appended to `prompt.txt`
+
+**Example:**
+```yaml
+modes:
+  - id: explain_full
+    params:
+      orchestrator: multi_agent
+      edge_variant: E1
+      synthesizer_variant: S0
+      auxiliary_agent: boundary
+```
+
+<Warning>
+The orchestrator parameter is validated at runtime. Invalid values will raise: `ValueError: orchestrator must be 'minimal' or 'multi_agent'` (see `engine.py:224-225`)
+</Warning>
+
+## Parameter reference
+
+### edge_variant
+
+**Type:** String
+
+**Valid values:** `E0`, `E1`, `E2`
+
+**Default:** `E0`
+
+**Purpose:** Controls how individual dependency edges are analyzed.
+
+**Source:** `explain_AS/engine.py:116`
+
+**Variants:**
+- **E0**: Factual analysis without refactoring suggestions
+- **E1**: Adds cautious intent inference from naming and structure
+- **E2**: Includes 1-2 decoupling suggestions per edge
+
+See [Agent variants](/advanced/agent-variants#edge-agent-variants) for detailed behavior.
+
+### synthesizer_variant
+
+**Type:** String
+
+**Valid values:** `S0`, `S1`, `S2`
+
+**Default:** `S0`
+
+**Purpose:** Controls how edge reports are synthesized into a cycle-level explanation.
+
+**Source:** `explain_AS/engine.py:117`
+
+**Variants:**
+- **S0**: Neutral explanation without edge-breaking recommendations
+- **S1**: Proposes 1-2 candidate edges to break with minimal plan
+- **S2**: Compares multiple candidates with trade-off analysis
+
+See [Agent variants](/advanced/agent-variants#synthesizer-agent-variants) for detailed behavior.
+
+### auxiliary_agent
+
+**Type:** String
+
+**Valid values:** `none`, `boundary`, `graph`, `review`
+
+**Default:** `none`
+
+**Purpose:** Provides additional context to the synthesizer (or replaces synthesizer output in review mode).
+
+**Source:** `explain_AS/engine.py:79-87`, `engine.py:118`
+
+**Validation:** Invalid values raise `ValueError: auxiliary_agent must be one of none|boundary|graph|review`
+
+**Agents:**
+- **none**: No auxiliary context
+- **boundary**: Infers architectural boundaries from file paths
+- **graph**: Analyzes SCC structural context
+- **review**: Rewrites synthesizer output for clarity
+
+See [Agent variants](/advanced/agent-variants#auxiliary-agents) for detailed behavior.
+
+## Example mode configurations
+
+### Minimal baseline
+
+```yaml
+modes:
+  - id: no_explain
+    params:
+      orchestrator: minimal
+```
+
+**Purpose:** Control group with no LLM explanation.
+
+**Output:** Only minimal prompt with cycle nodes.
+
+### Standard factual explanation
+
+```yaml
+modes:
+  - id: explain_E0_S0_noaux
+    params:
+      orchestrator: multi_agent
+      edge_variant: E0
+      synthesizer_variant: S0
+      auxiliary_agent: none
+```
+
+**Purpose:** Neutral, factual cycle explanation without bias.
+
+**Output:** Edge-by-edge analysis + cohesive cycle summary.
+
+### Boundary-aware explanation
+
+```yaml
+modes:
+  - id: explain_E0_S0_boundary
+    params:
+      orchestrator: multi_agent
+      edge_variant: E0
+      synthesizer_variant: S0
+      auxiliary_agent: boundary
+```
+
+**Purpose:** Adds architectural boundary inference from file paths.
+
+**Output:** Cycle explanation enriched with likely boundary violations.
+
+### Structural analysis
+
+```yaml
+modes:
+  - id: explain_E0_S0_graph
+    params:
+      orchestrator: multi_agent
+      edge_variant: E0
+      synthesizer_variant: S0
+      auxiliary_agent: graph
+```
+
+**Purpose:** Includes SCC-level structural context (hubs, bridges).
+
+**Output:** Cycle explanation with graph topology insights.
+
+### Prescriptive with plan
+
+```yaml
+modes:
+  - id: explain_E0_S1_noaux
+    params:
+      orchestrator: multi_agent
+      edge_variant: E0
+      synthesizer_variant: S1
+      auxiliary_agent: none
+```
+
+**Purpose:** Generates concrete refactoring plan with 1-2 candidate edges.
+
+**Output:** Cycle explanation + minimal refactoring strategy.
+
+### Trade-off comparison
+
+```yaml
+modes:
+  - id: explain_E1_S2_boundary
+    params:
+      orchestrator: multi_agent
+      edge_variant: E1
+      synthesizer_variant: S2
+      auxiliary_agent: boundary
+```
+
+**Purpose:** Compares multiple refactoring options with risk analysis.
+
+**Output:** Ranked candidates with pros/cons and boundary context.
+
+### Polished review mode
+
+```yaml
+modes:
+  - id: explain_E0_S0_review
+    params:
+      orchestrator: multi_agent
+      edge_variant: E0
+      synthesizer_variant: S0
+      auxiliary_agent: review
+```
+
+**Purpose:** Produces internally consistent, well-written explanations.
+
+**Output:** Reviewer-rewritten cycle explanation (replaces synthesizer output).
+
+## Running experiments with multiple modes
+
+You can define multiple modes in `pipeline.yaml` and run them in parallel or sequentially.
+
+### Configuration example
+
+```yaml
+# configs/pipeline.yaml
+projects_dir: projects_to_analyze
+repos_file: repos.txt
+cycles_file: cycles_to_analyze.txt
+results_root: results
+experiment_id: expA
+
+llm:
+  base_url: "http://host.docker.internal:8012/v1"
+  api_key: "placeholder"
+  model_raw: "/path/to/model"
+
+openhands:
+  image: "docker.all-hands.dev/all-hands-ai/openhands:0.59"
+  runtime_image: "docker.all-hands.dev/all-hands-ai/runtime:0.59-nikolaik"
+  max_iters: 100
+  commit_message: "Refactor: break dependency cycle"
+
+modes:
+  - id: no_explain
+    params:
+      orchestrator: minimal
+
+  - id: explain_E0_S0_noaux
+    params:
+      orchestrator: multi_agent
+      edge_variant: E0
+      synthesizer_variant: S0
+      auxiliary_agent: none
+
+  - id: explain_E1_S0_boundary
+    params:
+      orchestrator: multi_agent
+      edge_variant: E1
+      synthesizer_variant: S0
+      auxiliary_agent: boundary
+
+  - id: explain_E0_S1_graph
+    params:
+      orchestrator: multi_agent
+      edge_variant: E0
+      synthesizer_variant: S1
+      auxiliary_agent: graph
+```
+
+### Running selected modes
+
+Use the `--modes` flag to run specific modes:
+
+```bash
+scripts/run_llm.sh -c configs/pipeline.yaml \
+  --modes explain_E0_S0_noaux \
+  --modes explain_E1_S0_boundary
+```
+
+Each mode creates a separate result directory:
+
+```
+results/expA/
+├── project_name/
+│   ├── main/
+│   │   ├── explain_E0_S0_noaux/
+│   │   │   ├── cycle_0/
+│   │   │   ├── cycle_1/
+│   │   │   └── ...
+│   │   ├── explain_E1_S0_boundary/
+│   │   │   ├── cycle_0/
+│   │   │   └── ...
+```
+
+## Mode naming conventions
+
+<Tip>
+Use descriptive mode IDs that encode the configuration for easier result interpretation:
+
+- `explain_E0_S0_noaux`: Edge variant E0, Synthesizer S0, no auxiliary
+- `explain_E1_S0_boundary`: Edge variant E1, Synthesizer S0, boundary agent
+- `explain_E0_S1_graph`: Edge variant E0, Synthesizer S1, graph agent
+
+This makes it easy to identify configurations from directory names.
+</Tip>
+
+## Validation and error handling
+
+The engine validates all parameters at runtime:
+
+<Accordion title="Orchestrator validation">
+From `engine.py:223-225`:
+```python
+if orchestrator_id not in {"minimal", "multi_agent"}:
+    raise ValueError("orchestrator must be 'minimal' or 'multi_agent'")
+```
+</Accordion>
+
+<Accordion title="Auxiliary agent validation">
+From `engine.py:79-87`:
+```python
+aux = str(params.get("auxiliary_agent") or "none").strip().lower()
+if aux not in {"none", "boundary", "graph", "review"}:
+    raise ValueError(f"auxiliary_agent must be one of none|boundary|graph|review (got {aux!r})")
+```
+</Accordion>
+
+<Accordion title="Edge variant validation">
+From `explain_AS/agents/prompts/prompts_edge.py:79-83`:
+```python
+v = EDGE_VARIANTS.get((variant_id or "").strip())
+if v is None:
+    raise ValueError(f"edge_variant must be one of {sorted(EDGE_VARIANTS.keys())} (got {variant_id!r})")
+```
+
+Valid values: `E0`, `E1`, `E2`
+</Accordion>
+
+<Accordion title="Synthesizer variant validation">
+From `explain_AS/agents/prompts/prompts_synthesizer.py:92-97`:
+```python
+v = SYNTHESIZER_VARIANTS.get((variant_id or "").strip())
+if v is None:
+    raise ValueError(f"synthesizer_variant must be one of {sorted(SYNTHESIZER_VARIANTS.keys())} (got {variant_id!r})")
+```
+
+Valid values: `S0`, `S1`, `S2`
+</Accordion>
+
+## Design principles for experimental modes
+
+### Control for confounds
+
+When comparing modes, change only one parameter at a time:
+
+```yaml
+modes:
+  # Baseline
+  - id: baseline
+    params:
+      orchestrator: multi_agent
+      edge_variant: E0
+      synthesizer_variant: S0
+      auxiliary_agent: none
+
+  # Test edge variant impact
+  - id: test_edge_E1
+    params:
+      orchestrator: multi_agent
+      edge_variant: E1  # <-- Only change
+      synthesizer_variant: S0
+      auxiliary_agent: none
+
+  # Test synthesizer variant impact
+  - id: test_synth_S1
+    params:
+      orchestrator: multi_agent
+      edge_variant: E0
+      synthesizer_variant: S1  # <-- Only change
+      auxiliary_agent: none
+```
+
+### Measure incrementally
+
+Build up complexity gradually:
+
+```yaml
+modes:
+  - id: level_0_minimal
+    params:
+      orchestrator: minimal
+
+  - id: level_1_basic
+    params:
+      orchestrator: multi_agent
+      edge_variant: E0
+      synthesizer_variant: S0
+      auxiliary_agent: none
+
+  - id: level_2_boundary
+    params:
+      orchestrator: multi_agent
+      edge_variant: E0
+      synthesizer_variant: S0
+      auxiliary_agent: boundary
+
+  - id: level_3_prescriptive
+    params:
+      orchestrator: multi_agent
+      edge_variant: E0
+      synthesizer_variant: S1
+      auxiliary_agent: boundary
+```
+
+### Document rationale
+
+Add comments to explain experimental hypotheses:
+
+```yaml
+modes:
+  # H1: Boundary context improves refactoring locality
+  - id: H1_boundary
+    params:
+      orchestrator: multi_agent
+      edge_variant: E0
+      synthesizer_variant: S0
+      auxiliary_agent: boundary
+
+  # H2: Prescriptive plans reduce refactoring iteration count
+  - id: H2_prescriptive
+    params:
+      orchestrator: multi_agent
+      edge_variant: E0
+      synthesizer_variant: S1
+      auxiliary_agent: none
+
+  # H3: Intent inference improves architectural alignment
+  - id: H3_intent
+    params:
+      orchestrator: multi_agent
+      edge_variant: E1
+      synthesizer_variant: S0
+      auxiliary_agent: none
+```
+
+<Note>
+Comments in YAML are preserved and help future readers understand the experimental design.
+</Note>

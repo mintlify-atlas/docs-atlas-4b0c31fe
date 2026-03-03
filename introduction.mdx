@@ -1,0 +1,147 @@
+---
+title: Multi-Agent LLM Framework for ATD
+description: Automated LLM-based architectural refactoring pipeline for analyzing and breaking dependency cycles in real-world software projects
+---
+
+# Multi-Agent LLM Framework for ATD
+
+An experimental research pipeline for automated detection, explanation, and refactoring of architectural technical debt (ATD) in open-source software projects using multi-agent LLM systems.
+
+## What is this framework?
+
+This framework automatically:
+
+1. **Extracts dependency graphs** from real-world codebases (Python and C#)
+2. **Identifies strongly connected components** (SCCs) representing architectural cycles
+3. **Explains dependency cycles** using a configurable multi-agent LLM team
+4. **Applies automated refactoring** via OpenHands integration
+5. **Evaluates results** with architectural and code-quality metrics
+
+All experiments run fully offline inside Docker containers with local Git branches—no remote pushes required.
+
+<Note>
+This is a **research framework** designed as a replication package for a master's thesis. It's optimized for reproducibility and large-scale experimentation.
+</Note>
+
+## Key features
+
+<CardGroup cols={2}>
+  <Card title="Multi-agent architecture" icon="users">
+    Configurable LLM team with edge analyzers, synthesizers, and auxiliary agents (boundary, graph, review)
+  </Card>
+  
+  <Card title="OpenHands integration" icon="robot">
+    Automated refactoring using OpenHands agent with LLM-generated explanations as context
+  </Card>
+  
+  <Card title="Docker-based isolation" icon="docker">
+    All experiments run in containers with pinned dependencies for reproducibility
+  </Card>
+  
+  <Card title="Local-only Git workflow" icon="git-alt">
+    Uses temporary worktrees and local branches—never pushes to remote
+  </Card>
+  
+  <Card title="Full observability" icon="chart-line">
+    Stores prompts, transcripts, patches, metrics, and logs for every experiment
+  </Card>
+  
+  <Card title="Fault tolerance" icon="shield-check">
+    Resume capability with automatic detection of incomplete phases
+  </Card>
+</CardGroup>
+
+## Architecture overview
+
+The pipeline consists of four main phases:
+
+<Steps>
+  <Step title="Baseline phase">
+    Extracts module-level dependency graphs using [Depends](https://github.com/multilang-depends/depends) and computes strongly connected components. Calculates baseline architectural metrics.
+  </Step>
+  
+  <Step title="Cycle selection phase">
+    Builds a catalog of architectural dependency cycles and selects a subset for analysis based on size constraints and sampling strategy.
+  </Step>
+  
+  <Step title="Explanation phase">
+    Multi-agent LLM team analyzes each cycle:
+    - **Edge agents** examine individual dependencies
+    - **Synthesizer agent** produces coherent explanation
+    - **Auxiliary agents** (optional) provide boundary analysis, graph context, or review
+  </Step>
+  
+  <Step title="Refactoring phase">
+    OpenHands executes automated refactoring using the LLM-generated explanation. Creates local Git branch, applies changes, and commits locally. No remote push.
+  </Step>
+  
+  <Step title="Metrics phase">
+    Recomputes architectural and code-quality metrics on refactored code using tools like Radon, Bandit, Lizard, Vulture, and PyExamine.
+  </Step>
+</Steps>
+
+## Multi-agent orchestration
+
+The framework supports two orchestration modes:
+
+### Minimal mode
+
+Generates a simple prompt listing cycle nodes without LLM-based analysis. Useful as a baseline.
+
+### Multi-agent mode
+
+Configurable team with:
+
+- **Edge variants** (E0, E1, E2): Different levels of dependency analysis detail
+- **Synthesizer variants** (S0, S1, S2): Different explanation generation strategies  
+- **Auxiliary agents**:
+  - `boundary`: Analyzes module boundaries and interfaces
+  - `graph`: Provides graph-theoretic context
+  - `review`: Reviews and critiques the explanation
+
+<Tip>
+You can mix and match variants to experiment with different agent configurations. All parameters are defined in `configs/pipeline.yaml`.
+</Tip>
+
+## Get started
+
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    Set up Python, Docker, and clone the framework
+  </Card>
+  
+  <Card title="Quick start" icon="rocket" href="/quickstart">
+    Run your first baseline analysis on a sample project
+  </Card>
+  
+  <Card title="Configuration" icon="gear" href="/guide/configuration">
+    Learn about pipeline.yaml and experiment configuration
+  </Card>
+  
+  <Card title="Results" icon="chart-bar" href="/advanced/results-structure">
+    Understand output structure and metrics
+  </Card>
+</CardGroup>
+
+## Platform requirements
+
+<Warning>
+Developed and tested on **Windows with WSL (Ubuntu) + Docker**. Compatibility with other platforms (macOS, native Linux) has not been verified.
+</Warning>
+
+All experiments run inside Linux containers. The project repository must be stored inside the Linux filesystem (not Windows filesystem when using WSL).
+
+## Use cases
+
+- **Research**: Replication package for architectural refactoring experiments
+- **Experimentation**: Test different LLM configurations and multi-agent strategies
+- **Analysis**: Study architectural technical debt in real-world projects
+- **Evaluation**: Compare automated refactoring approaches with metrics
+
+## Next steps
+
+<CardGroup cols={1}>
+  <Card title="Install the framework" icon="download" href="/installation">
+    Get Python dependencies, Docker, and the source code ready
+  </Card>
+</CardGroup>

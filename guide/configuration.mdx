@@ -1,0 +1,195 @@
+---
+title: Configuration
+description: YAML configuration file structure and options for the ATD pipeline
+---
+
+All experiments in the ATD pipeline are configured through a YAML file, typically stored in the `configs/` directory. This file controls project locations, LLM endpoints, OpenHands settings, and experimental modes.
+
+## Basic structure
+
+Create a configuration file (e.g., `configs/pipeline.yaml`) with the following structure:
+
+```yaml
+projects_dir: projects_to_analyze
+repos_file: repos.txt
+cycles_file: cycles_to_analyze.txt
+results_root: results
+experiment_id: expA
+
+policy:
+  delete_refactor_branches_after_metrics: true
+
+llm:
+  base_url: "http://host.docker.internal:8012/v1"
+  api_key: "placeholder"
+  model_raw: "Qwen3-Coder-30B-A3B-Instruct"
+  context_length: 32768
+
+openhands:
+  runtime_image: "docker.openhands.dev/openhands/runtime:1.4-nikolaik"
+  max_iters: 150
+  commit_message: "Refactor: break dependency cycle"
+
+modes:
+  - id: explain_E0_S0_noaux
+    params:
+      orchestrator: multi_agent
+      edge_variant: E0
+      synthesizer_variant: S0
+      auxiliary_agent: none
+```
+
+## Root configuration fields
+
+### Directory and file paths
+
+<Info>
+All paths in the configuration are relative to the repository root unless specified as absolute paths.
+</Info>
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `projects_dir` | string | Directory containing cloned subject repositories for analysis |
+| `repos_file` | string | Path to the repository list file (see [Repository preparation](/guide/repository-preparation)) |
+| `cycles_file` | string | Path to the selected cycles file generated during cycle selection |
+| `results_root` | string | Root directory where all experiment outputs are stored |
+| `experiment_id` | string | Unique identifier for this experiment run |
+
+## Policy configuration
+
+The `policy` section controls pipeline behavior:
+
+```yaml
+policy:
+  delete_refactor_branches_after_metrics: true
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `delete_refactor_branches_after_metrics` | boolean | Whether to delete local refactoring branches after metrics collection completes |
+
+<Warning>
+Setting this to `false` will accumulate many local branches during large experiments.
+</Warning>
+
+## LLM configuration
+
+The `llm` section specifies the OpenAI-compatible LLM endpoint:
+
+```yaml
+llm:
+  base_url: "http://host.docker.internal:8012/v1"
+  api_key: "placeholder"
+  model_raw: "Qwen3-Coder-30B-A3B-Instruct"
+  context_length: 32768
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `base_url` | string | OpenAI-compatible API endpoint URL. Must be accessible from inside the Docker container and support the `/v1/chat/completions` API |
+| `api_key` | string | API key for authentication (required but can be a placeholder if your endpoint doesn't require authentication) |
+| `model_raw` | string | Model identifier passed to the LLM endpoint |
+| `context_length` | integer | Maximum context window size for the model |
+
+<Note>
+Use `host.docker.internal` to reference services running on your Docker host machine from within the container.
+</Note>
+
+## OpenHands configuration
+
+The `openhands` section controls the automated refactoring agent:
+
+```yaml
+openhands:
+  runtime_image: "docker.openhands.dev/openhands/runtime:1.4-nikolaik"
+  max_iters: 150
+  commit_message: "Refactor: break dependency cycle"
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `runtime_image` | string | Docker image for the OpenHands runtime environment |
+| `max_iters` | integer | Maximum number of agent iterations before timeout |
+| `commit_message` | string | Git commit message used for all refactoring commits |
+
+## Experimental modes
+
+The `modes` section defines one or more experimental configurations. Each mode represents a different multi-agent orchestration strategy:
+
+```yaml
+modes:
+  - id: no_explain
+    params:
+      orchestrator: minimal
+
+  - id: explain_E0_S0_noaux
+    params:
+      orchestrator: multi_agent
+      edge_variant: E0
+      synthesizer_variant: S0
+      auxiliary_agent: none
+
+  - id: explain_E1_S0_boundary
+    params:
+      orchestrator: multi_agent
+      edge_variant: E1
+      synthesizer_variant: S0
+      auxiliary_agent: boundary
+```
+
+### Mode parameters
+
+| Parameter | Type | Options | Description |
+|-----------|------|---------|-------------|
+| `orchestrator` | string | `minimal`, `multi_agent` | Agent orchestration strategy. `minimal` skips explanation generation |
+| `edge_variant` | string | `E0`, `E1`, `E2` | Edge agent prompt variant (required when `orchestrator: multi_agent`) |
+| `synthesizer_variant` | string | `S0`, `S1`, `S2` | Synthesizer agent prompt variant (required when `orchestrator: multi_agent`) |
+| `auxiliary_agent` | string | `none`, `boundary`, `graph`, `review` | Optional auxiliary agent to include in the pipeline |
+
+<Info>
+The `edge_variant` and `synthesizer_variant` parameters are only required when using `orchestrator: multi_agent`.
+</Info>
+
+## Configuration validation
+
+The pipeline validates all configuration parameters at startup using the schema defined in `atd_pipeline/config.py:88-170`. Common validation errors include:
+
+- Missing required fields (e.g., `projects_dir`, `experiment_id`)
+- Invalid mode parameter combinations (e.g., `edge_variant` without `multi_agent`)
+- Type mismatches (e.g., string provided for integer field)
+- Invalid enum values (e.g., `auxiliary_agent: invalid_option`)
+
+<Warning>
+The pipeline will fail fast if configuration validation fails. Check error messages carefully to identify the specific field causing issues.
+</Warning>
+
+## Multiple mode experiments
+
+You can define multiple modes in a single configuration to compare different approaches:
+
+```yaml
+modes:
+  - id: baseline_no_explain
+    params:
+      orchestrator: minimal
+
+  - id: variant_A
+    params:
+      orchestrator: multi_agent
+      edge_variant: E0
+      synthesizer_variant: S0
+      auxiliary_agent: none
+
+  - id: variant_B
+    params:
+      orchestrator: multi_agent
+      edge_variant: E1
+      synthesizer_variant: S1
+      auxiliary_agent: boundary
+```
+
+When running experiments, you can select specific modes using the `--modes` flag:
+
+```bash
+scripts/run_llm.sh -c configs/pipeline.yaml --modes variant_A --modes variant_B
+```

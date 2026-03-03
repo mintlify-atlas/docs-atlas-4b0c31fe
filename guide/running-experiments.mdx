@@ -1,0 +1,256 @@
+---
+title: Running experiments
+description: Execute baseline analysis, cycle selection, LLM refactoring, and metrics collection
+---
+
+The ATD pipeline consists of four main phases executed sequentially inside the Docker container. Each phase has a dedicated script in the `scripts/` directory.
+
+## Experiment workflow
+
+<Steps>
+
+### Run baseline analysis
+
+The baseline phase extracts dependency graphs and computes strongly connected components (SCCs) for all subject repositories:
+
+```bash
+scripts/run_baseline.sh -c configs/pipeline.yaml
+```
+
+This command:
+- Reads repository specifications from `repos.txt`
+- Extracts module-level dependency graphs using Depends
+- Identifies strongly connected components (architectural cycles)
+- Computes baseline architectural metrics
+- Stores results in `results_root/baseline/<repo>/<branch>/`
+
+<Info>
+Baseline analysis only needs to run once per repository unless you modify the source code or dependencies.
+</Info>
+
+### Select cycles for analysis
+
+The cycle selection phase builds a catalog of all detected cycles and selects a subset for refactoring:
+
+```bash
+scripts/build_cycles_to_analyze.sh -c configs/pipeline.yaml \
+  --total 100 \
+  --min-size 2 \
+  --max-size 8 \
+  --out cycles_to_analyze.txt
+```
+
+**Parameters:**
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `--total` | Yes | Total number of cycles to select across all repositories |
+| `--min-size` | No | Minimum number of modules in a cycle (default: 2) |
+| `--max-size` | No | Maximum number of modules in a cycle (default: unlimited) |
+| `--out` | No | Output file path (default: `cycles_to_analyze.txt`) |
+
+The script:
+- Rebuilds `cycle_catalog.json` for all repositories with baseline results
+- Applies even-by-cycle-size selection strategy for balanced representation
+- Ensures repository fairness (no single repo dominates the selection)
+- Writes the selected cycles to the output file
+
+<Note>
+The generated `cycles_to_analyze.txt` file should match the `cycles_file` path in your YAML configuration.
+</Note>
+
+### Execute LLM-based refactoring
+
+The refactoring phase uses multi-agent LLM teams to explain cycles and OpenHands to apply automated refactoring:
+
+```bash
+scripts/run_llm.sh -c configs/pipeline.yaml --modes explain_E0_S0_noaux
+```
+
+For multiple modes:
+
+```bash
+scripts/run_llm.sh -c configs/pipeline.yaml \
+  --modes explain_E0_S0_noaux \
+  --modes explain_E1_S0_boundary
+```
+
+<Note>
+If you omit the `--modes` flag, all modes defined in the configuration file will be executed.
+</Note>
+
+For each cycle and mode, this command:
+- Creates a temporary Git worktree with a dedicated local branch
+- Generates cycle explanation using the multi-agent LLM team (if `orchestrator: multi_agent`)
+- Launches OpenHands with the explanation as context
+- Commits all changes locally (never pushes to remote)
+- Stores complete logs, trajectories, and patches in the results directory
+- Removes the temporary worktree after completion
+
+<Warning>
+Ensure your LLM endpoint is running and accessible at the `base_url` specified in the configuration before starting this phase.
+</Warning>
+
+### Collect post-refactoring metrics
+
+The metrics phase recomputes architectural and code-quality metrics on the refactored code:
+
+```bash
+scripts/run_metrics.sh -c configs/pipeline.yaml --modes explain_E0_S0_noaux
+```
+
+For multiple modes:
+
+```bash
+scripts/run_metrics.sh -c configs/pipeline.yaml \
+  --modes explain_E0_S0_noaux \
+  --modes explain_E1_S0_boundary
+```
+
+This command:
+- Extracts dependency graphs from refactored branches
+- Recomputes SCCs and architectural metrics
+- Runs code quality analysis using PyExamine
+- Executes test suites to verify correctness
+- Stores metrics alongside refactoring results
+- Optionally deletes refactoring branches (controlled by `policy.delete_refactor_branches_after_metrics`)
+
+</Steps>
+
+## Running experiments in sequence
+
+For a complete experimental run, execute all four phases sequentially:
+
+```bash
+# 1. Baseline analysis
+scripts/run_baseline.sh -c configs/pipeline.yaml
+
+# 2. Cycle selection (select 100 cycles, size 2-8)
+scripts/build_cycles_to_analyze.sh -c configs/pipeline.yaml \
+  --total 100 \
+  --min-size 2 \
+  --max-size 8 \
+  --out cycles_to_analyze.txt
+
+# 3. LLM refactoring (run all configured modes)
+scripts/run_llm.sh -c configs/pipeline.yaml
+
+# 4. Metrics collection (run all configured modes)
+scripts/run_metrics.sh -c configs/pipeline.yaml
+```
+
+## Understanding script wrappers
+
+All scripts in `scripts/` are thin wrappers around the Python CLI module `atd_pipeline.cli`. You can also invoke the CLI directly:
+
+```bash
+# Equivalent to scripts/run_baseline.sh
+python3 -m atd_pipeline.cli baseline -c configs/pipeline.yaml
+
+# Equivalent to scripts/run_llm.sh
+python3 -m atd_pipeline.cli llm -c configs/pipeline.yaml --modes mode1
+
+# Equivalent to scripts/run_metrics.sh
+python3 -m atd_pipeline.cli metrics -c configs/pipeline.yaml --modes mode1
+```
+
+The wrapper scripts (defined in `scripts/run_baseline.sh:1-15`, `scripts/run_llm.sh:1-15`, `scripts/run_metrics.sh:1-15`) provide a convenient interface and ensure the correct working directory.
+
+## Resume and fault tolerance
+
+The pipeline supports resuming interrupted experiments:
+
+- Each phase stores completion markers in the results directory
+- Completed cycles are skipped on subsequent runs
+- Incomplete phases are detected and results are discarded
+- No duplicate work is performed when resuming
+
+<Info>
+To resume an interrupted experiment, simply re-run the same command. The pipeline will automatically detect and skip completed work.
+</Info>
+
+## Results directory structure
+
+All experimental outputs are stored under `results_root/` with the following structure:
+
+```
+results/
+├── baseline/
+│   └── <repo>/
+│       └── <branch>/
+│           ├── graph.json
+│           ├── scc_report.json
+│           └── metrics.json
+├── llm_runs/
+│   └── <experiment_id>/
+│       └── <repo>/
+│           └── <branch>/
+│               └── <cycle_id>/
+│                   └── <mode_id>/
+│                       ├── explanation_prompt.txt
+│                       ├── explanation_transcript.json
+│                       ├── openhands_log.txt
+│                       ├── trajectory.json
+│                       └── refactor.patch
+└── metrics/
+    └── <experiment_id>/
+        └── <repo>/
+            └── <branch>/
+                └── <cycle_id>/
+                    └── <mode_id>/
+                        ├── graph_after.json
+                        ├── scc_report_after.json
+                        ├── metrics_after.json
+                        ├── test_results.json
+                        └── code_quality.json
+```
+
+These artifacts enable full reproducibility and post-hoc inspection of every refactoring attempt.
+
+## Monitoring experiment progress
+
+The pipeline provides progress indicators during execution:
+
+- Total number of tasks (cycles × modes)
+- Current task index
+- Repository, branch, cycle ID, and mode ID for each task
+- Completion status (success, failure, skipped)
+
+Monitor the console output to track experiment progress and identify any failures.
+
+## Common execution patterns
+
+### Test configuration with a single cycle
+
+Create a minimal `cycles_to_analyze.txt` with one cycle:
+
+```bash
+echo "myrepo main cycle_001" > cycles_to_analyze_test.txt
+```
+
+Update your configuration to reference this file, then run:
+
+```bash
+scripts/run_llm.sh -c configs/test_pipeline.yaml
+scripts/run_metrics.sh -c configs/test_pipeline.yaml
+```
+
+### Run only specific modes
+
+To experiment with a subset of configured modes:
+
+```bash
+scripts/run_llm.sh -c configs/pipeline.yaml \
+  --modes baseline_no_explain \
+  --modes variant_A
+```
+
+### Rerun metrics without refactoring
+
+If you only need to recompute metrics (e.g., after fixing a bug in the metrics code):
+
+```bash
+scripts/run_metrics.sh -c configs/pipeline.yaml
+```
+
+The metrics phase does not require re-running the LLM phase as long as refactoring branches still exist.

@@ -1,0 +1,303 @@
+---
+title: Repository preparation
+description: Prepare subject repositories for architectural dependency cycle analysis
+---
+
+Before running experiments, you must manually prepare all subject repositories. The pipeline does not automatically download repositories to ensure offline reproducibility.
+
+## Repository directory structure
+
+All subject repositories must be cloned into the directory specified by `projects_dir` in your configuration file (default: `projects_to_analyze/`):
+
+```
+projects_to_analyze/
+├── repo1/
+│   └── .git/
+├── repo2/
+│   └── .git/
+└── repo3/
+    └── .git/
+```
+
+<Info>
+The pipeline expects each repository to be a complete Git repository with full history, not a shallow clone.
+</Info>
+
+## Cloning repositories
+
+<Steps>
+
+### Create the projects directory
+
+From the repository root:
+
+```bash
+mkdir -p projects_to_analyze
+cd projects_to_analyze
+```
+
+### Clone subject repositories
+
+Clone each repository you want to analyze:
+
+```bash
+git clone https://github.com/owner/repo1.git
+git clone https://github.com/owner/repo2.git
+git clone https://github.com/owner/repo3.git
+```
+
+<Warning>
+Do not use shallow clones (`--depth 1`). The pipeline requires full Git history for creating worktrees and branches.
+</Warning>
+
+### Verify repository state
+
+Ensure each repository is on the correct base branch:
+
+```bash
+cd repo1
+git checkout main
+cd ../repo2
+git checkout master
+cd ..
+```
+
+</Steps>
+
+## Repository specification file
+
+Create a `repos.txt` file (or use the path specified by `repos_file` in your configuration) with one line per repository:
+
+```
+repo1 main src python
+repo2 master . csharp
+repo3 develop lib python
+```
+
+### File format
+
+Each line contains four space-separated fields:
+
+| Column | Description | Example |
+|--------|-------------|----------|
+| 1. Repository name | Directory name in `projects_dir` | `repo1` |
+| 2. Base branch | Git branch to analyze | `main`, `master`, `develop` |
+| 3. Entry directory | Subdirectory containing source code (`.` for root) | `src`, `lib`, `.` |
+| 4. Language | Implementation language | `python`, `csharp`, `java` |
+
+<Info>
+The repository name must exactly match the directory name in `projects_dir`.
+</Info>
+
+### Example repos.txt
+
+```text
+flask main flask python
+django main django python
+requests main requests python
+newtonsoft-json master Src/Newtonsoft.Json csharp
+```
+
+### Comments and blank lines
+
+Lines starting with `#` are treated as comments and ignored:
+
+```text
+# Python web frameworks
+flask main flask python
+django main django python
+
+# HTTP libraries
+requests main requests python
+```
+
+## Language-specific considerations
+
+### Python repositories
+
+For Python projects:
+- Set `language: python`
+- Set `entry` to the directory containing the main package (e.g., `src`, `lib`, or `.`)
+- Ensure the project has a valid dependency structure (not a flat module)
+
+### C# repositories
+
+For C# projects:
+- Set `language: csharp`
+- Set `entry` to the directory containing `.csproj` or `.sln` files
+- Ensure all .NET SDKs required by the project are available in the Docker image (see [Docker setup](/guide/docker-setup))
+
+### Java repositories
+
+For Java projects:
+- Set `language: java`
+- Set `entry` to the directory containing source files (typically `src/main/java`)
+- Ensure the project structure is compatible with the Depends tool
+
+<Note>
+The Depends tool supports multiple languages. See the [Depends documentation](https://github.com/multilang-depends/depends) for compatibility details.
+</Note>
+
+## Validation
+
+You can validate your repository setup by parsing the `repos.txt` file:
+
+```python
+from pathlib import Path
+from atd_pipeline.config import read_repos
+
+repos = read_repos(Path("repos.txt"))
+for repo in repos:
+    print(f"{repo.repo}: {repo.base_branch} @ {repo.entry} ({repo.language})")
+```
+
+This script (using code from `atd_pipeline/config.py:217-228`) will fail if the file format is invalid.
+
+## Cycle selection file
+
+The `cycles_to_analyze.txt` file (specified by `cycles_file` in your configuration) is **generated automatically** by the cycle selection script. You should not create or edit this file manually.
+
+### File format
+
+After running cycle selection, the file will contain:
+
+```
+repo1 main cycle_001
+repo1 main cycle_005
+repo2 master cycle_002
+repo3 develop cycle_003
+```
+
+Each line contains three space-separated fields:
+
+| Column | Description |
+|--------|-------------|
+| 1. Repository name | Must match a repository in `repos.txt` |
+| 2. Base branch | Must match the branch in `repos.txt` |
+| 3. Cycle ID | Unique identifier for a strongly connected component |
+
+<Warning>
+Do not edit `cycles_to_analyze.txt` manually unless you understand the cycle ID format. Use the `build_cycles_to_analyze.sh` script instead.
+</Warning>
+
+## Directory structure after preparation
+
+After completing repository preparation, your project structure should look like:
+
+```
+.
+├── projects_to_analyze/          # Subject repositories
+│   ├── repo1/
+│   │   └── .git/
+│   ├── repo2/
+│   │   └── .git/
+│   └── repo3/
+│       └── .git/
+├── repos.txt                      # Repository specifications (manual)
+├── cycles_to_analyze.txt          # Selected cycles (generated)
+├── configs/
+│   └── pipeline.yaml              # Experiment configuration
+└── results/                       # Will be created by pipeline
+```
+
+## Verifying preparation
+
+Before running experiments, verify your setup:
+
+<Steps>
+
+### Check repository clones
+
+```bash
+ls projects_to_analyze/
+# Should list all repositories from repos.txt
+```
+
+### Check repos.txt format
+
+```bash
+cat repos.txt
+# Each line should have exactly 4 space-separated fields
+```
+
+### Validate configuration
+
+```bash
+python3 -c "
+import yaml
+from pathlib import Path
+config = yaml.safe_load(Path('configs/pipeline.yaml').read_text())
+print(f\"Projects dir: {config['projects_dir']}\")
+print(f\"Repos file: {config['repos_file']}\")
+print(f\"Cycles file: {config['cycles_file']}\")
+"
+```
+
+### Test baseline phase
+
+Run baseline analysis on a single repository to verify everything works:
+
+```bash
+scripts/run_baseline.sh -c configs/pipeline.yaml
+```
+
+If successful, this will create `results/baseline/<repo>/<branch>/` directories with dependency graphs.
+
+</Steps>
+
+## Common issues
+
+### Repository not found
+
+**Error**: `cycles_file references unknown repo 'repo1' (not present in repos_file)`
+
+**Cause**: Repository name in `cycles_to_analyze.txt` doesn't match `repos.txt`.
+
+**Solution**: Ensure repository names are consistent across both files.
+
+### Base branch mismatch
+
+**Error**: `Base branch mismatch for repo repo1: repos_file has main, cycles_file has master`
+
+**Cause**: Branch name inconsistency between `repos.txt` and `cycles_to_analyze.txt`.
+
+**Solution**: Use the same branch names in both files. The validation logic is defined in `atd_pipeline/config.py:267-269`.
+
+### Directory does not exist
+
+**Error**: `FileNotFoundError: projects_to_analyze/repo1`
+
+**Cause**: Repository not cloned or wrong directory name.
+
+**Solution**: Clone the repository with the exact name specified in `repos.txt`.
+
+### Empty or invalid repos.txt
+
+**Error**: `Bad repos.txt line (expected 4 columns)`
+
+**Cause**: Line in `repos.txt` has fewer than 4 fields.
+
+**Solution**: Check that each non-comment, non-empty line has exactly 4 space-separated fields.
+
+## Best practices
+
+- Keep `repos.txt` under version control for reproducibility
+- Do not version `cycles_to_analyze.txt` (it's generated)
+- Use consistent branch names (prefer `main` over `master` for new projects)
+- Clone repositories at specific commits or tags for reproducible experiments
+- Document the commit SHA or tag for each repository in your experiment notes
+- Store the generated `cycles_to_analyze.txt` with experiment results for reference
+
+## Reproducing experiments
+
+To reproduce experiments exactly:
+
+1. Clone repositories at the same commit SHAs
+2. Use the same `repos.txt` file
+3. Use the same `cycles_to_analyze.txt` file (or regenerate with the same parameters)
+4. Use the same pipeline configuration
+5. Use the same Docker image (pin versions in Dockerfile)
+
+<Info>
+The pipeline stores experiment metadata in the results directory, including repository commits, configuration files, and timestamps.
+</Info>

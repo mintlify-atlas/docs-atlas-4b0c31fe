@@ -1,0 +1,146 @@
+---
+title: explain
+description: Generate refactoring prompts for detected ATD cycles using LLM
+---
+
+Generates natural language explanations and refactoring prompts for architectural technical debt cycles identified during baseline analysis. Uses the configured LLM to analyze cycle structures and create actionable refactoring instructions.
+
+## Usage
+
+```bash
+python3 -m atd_pipeline.cli explain -c <config_file> [--modes MODE1 MODE2 ...]
+```
+
+## Parameters
+
+<ParamField path="config" type="Path" required>
+  Path to the pipeline configuration YAML file.
+  
+  **Flags:** `-c`, `--config`
+  
+  **Example:** `-c pipeline.yaml`
+</ParamField>
+
+<ParamField path="modes" type="List[str]" default="all modes">
+  Filter which experimental modes to run. If not specified, runs all modes defined in the configuration.
+  
+  **Flag:** `--modes`
+  
+  **Example:** `--modes baseline-explain gpt4-explain`
+</ParamField>
+
+## What it does
+
+For each experiment unit (repository × cycle × mode combination):
+
+1. **Validates inputs** - Checks that baseline `scc_report.json` and `cycle_catalog.json` exist
+2. **Loads cycle information** - Reads cycle structure and dependencies
+3. **Prepares prompt generation** - Gathers code context and metrics
+4. **Invokes LLM** - Runs `explain_AS/explain_entry.py` with cycle data
+5. **Writes prompt** - Saves generated refactoring instructions to `prompt.txt`
+6. **Tracks status** - Records outcome in `_phase_explain.json`
+
+## Output structure
+
+```
+<results_root>/<repo>/<experiment_branch>/
+├── explain/
+│   └── prompt.txt          # Generated refactoring instructions
+└── _phase_explain.json     # Execution status
+```
+
+## Environment variables
+
+The explain phase respects these environment overrides:
+
+- **ATD_LLM_URL** - Override LLM endpoint from config
+- **ATD_LLM_BASE_URL** - Override LLM base URL from config
+- **ATD_MODE_PARAMS_JSON** - Mode-specific parameters (automatically set)
+
+## Examples
+
+<CodeGroup>
+
+```bash Run all modes
+python3 -m atd_pipeline.cli explain -c pipeline.yaml
+```
+
+```bash Run specific modes
+python3 -m atd_pipeline.cli explain -c pipeline.yaml --modes gpt4-explain claude-explain
+```
+
+```bash With custom LLM endpoint
+ATD_LLM_URL="http://localhost:8000/v1" python3 -m atd_pipeline.cli explain -c pipeline.yaml
+```
+
+</CodeGroup>
+
+## Prerequisites
+
+<Warning>
+Baseline must be completed before running explain:
+```bash
+python3 -m atd_pipeline.cli baseline -c pipeline.yaml
+```
+</Warning>
+
+Required baseline artifacts:
+- `ATD_identification/scc_report.json`
+- `ATD_identification/cycle_catalog.json`
+
+## Status outcomes
+
+### Success (ok)
+- `prompt.txt` exists and contains generated content
+- Ready for openhands phase
+
+### Failed
+- Missing baseline artifacts
+- LLM generation error
+- Empty or invalid prompt output
+
+### Blocked
+- `llm_unavailable` - LLM service unreachable or rate limited
+
+<Note>
+When `stop_on_llm_blocked` is true (default), the command stops immediately if any unit is blocked by LLM unavailability.
+</Note>
+
+## Command invocation
+
+The explain phase internally calls:
+
+```bash
+python3 explain_AS/explain_entry.py \
+  --repo-root /path/to/repo \
+  --src-root src \
+  --scc-report /path/to/scc_report.json \
+  --cycle-catalog /path/to/cycle_catalog.json \
+  --cycle-id "cycle_123" \
+  --out-prompt /path/to/prompt.txt
+```
+
+## Mode filtering
+
+Modes are defined in your configuration file:
+
+```yaml
+modes:
+  - name: gpt4-explain
+    params:
+      model: gpt-4
+      temperature: 0.2
+  - name: claude-explain
+    params:
+      model: claude-3-sonnet
+```
+
+Use `--modes` to run only specific modes:
+
+```bash
+python3 -m atd_pipeline.cli explain -c pipeline.yaml --modes gpt4-explain
+```
+
+## Implementation
+
+See `atd_pipeline/cli.py:166` for the `run_explain_phase` function and `cli.py:426` for the command definition.

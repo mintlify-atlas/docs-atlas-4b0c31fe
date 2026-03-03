@@ -1,0 +1,570 @@
+---
+title: Multi-agent system
+description: Detailed documentation of the five specialized agents in the ATD explanation system
+---
+
+The ATD framework uses a **multi-agent architecture** where specialized agents collaboratively analyze dependency cycles. Each agent has a distinct role, prompt strategy, and token budget.
+
+## Agent architecture
+
+### Orchestration flow
+
+From `explain_AS/engine.py:96-208`, the multi-agent orchestration follows this sequence:
+
+<Steps>
+  <Step title="Edge agents (parallel)">
+    Analyze each directed edge in the cycle independently, explaining dependency relationships
+  </Step>
+  <Step title="Auxiliary agent (optional)">
+    Provide additional context: boundary heuristics (Boundary), SCC structure (Graph), or none
+  </Step>
+  <Step title="Synthesizer agent">
+    Combine edge reports and auxiliary context into a coherent cycle-level explanation
+  </Step>
+  <Step title="Review agent (optional)">
+    Revise synthesizer output for clarity and consistency without adding new facts
+  </Step>
+</Steps>
+
+### Base agent implementation
+
+All agents share a common execution pattern through the `Agent` class in `explain_AS/llm.py`:
+
+```python
+class Agent:
+    def __init__(self, name: str):
+        self.name = name
+    
+    def ask(
+        self,
+        client: LLMClient,
+        transcript_path: str,
+        user_prompt: str,
+        min_output_tokens_reserved: int,
+        safety_margin_tokens: int,
+        max_output_chars_soft: Optional[int] = None,
+    ) -> str:
+        # Execute LLM call with token budgeting and retry logic
+```
+
+## Edge agent
+
+**File:** `explain_AS/agents/edge.py`
+
+**Role:** Analyze a single directed edge A → B in the dependency cycle.
+
+### Responsibility
+
+The edge agent examines **why A depends on B** by analyzing the full source code of both files. It identifies:
+- Specific import/using statements
+- Which symbols from B are used by A
+- The semantic purpose of the dependency
+
+### Implementation
+
+From `explain_AS/agents/edge.py:124-155`:
+
+```python
+def run_edge_agent(
+    *,
+    client: LLMClient,
+    transcript_path: str,
+    language: str,
+    cycle_nodes: List[str],
+    edge: Edge,
+    files_by_node: Dict[str, str],
+    edge_variant_id: str = "E0",
+) -> str:
+    language = require_language(language)
+    edge_agent = Agent(name="edge")
+    
+    user_prompt = build_edge_user_prompt(
+        client=client,
+        language=language,
+        cycle_nodes=cycle_nodes,
+        edge=edge,
+        files_by_node=files_by_node,
+        edge_variant_id=edge_variant_id,
+    )
+    
+    return edge_agent.ask(
+        client=client,
+        transcript_path=transcript_path,
+        user_prompt=user_prompt,
+        edge=edge_str(edge.a, edge.b),
+        min_output_tokens_reserved=2000,
+        safety_margin_tokens=1000,
+    )
+```
+
+### Token budgeting
+
+From `explain_AS/agents/edge.py:34-95`:
+
+```python
+overhead_tokens_estimate = estimate_tokens_from_text(prompt_prefix + file_separator + prompt_suffix)
+total_input_tokens_budget = (
+    int(client.context_length)
+    - int(EDGE_SAFETY_MARGIN_TOKENS)  # 1000
+    - int(EDGE_MIN_OUTPUT_TOKENS_RESERVED)  # 2000
+    - int(overhead_tokens_estimate)
+)
+
+file_a_tokens_allocated, file_b_tokens_allocated = allocate_two_way_with_redistribution(
+    need_a=int(file_a_tokens_needed),
+    need_b=int(file_b_tokens_needed),
+    total_tokens=int(total_input_tokens_budget),
+)
+```
+
+<Info>
+  **Two-way redistribution:** If one file is small, its unused budget is reallocated to the other file, maximizing context utilization.
+</Info>
+
+### Prompt structure
+
+```text
+{edge_variant_preamble}
+
+---
+
+{language_semantics}
+
+Cycle chain:
+{cycle_nodes_formatted}
+
+Analyze this specific edge:
+A = src/domain/user.py
+B = src/persistence/user_repository.py
+
+{output_headings}
+
+File A:
+{file_a_content}
+
+File B:
+{file_b_content}
+```
+
+<Accordion title="Edge variants (E0, E1, E2)">
+  Different edge variants use different prompt strategies:
+  - **E0:** Standard edge analysis with balanced detail
+  - **E1:** Focused on minimal dependency identification
+  - **E2:** Expanded architectural reasoning
+  
+  Variants are configured via `mode_spec.params.edge_variant`.
+</Accordion>
+
+## Synthesizer agent
+
+**File:** `explain_AS/agents/synthesizer.py`
+
+**Role:** Combine multiple edge reports into a unified cycle-level explanation.
+
+### Responsibility
+
+The synthesizer receives:
+- Edge reports for all edges in the cycle
+- Optional auxiliary context (from boundary or graph agents)
+
+It produces a coherent narrative explaining:
+- How the cycle is formed (the circular dependency chain)
+- Why the coupling exists (architectural interpretation)
+- Impact on maintainability
+
+### Implementation
+
+From `explain_AS/agents/synthesizer.py:97-127`:
+
+```python
+def run_synthesizer_agent(
+    *,
+    client: LLMClient,
+    transcript_path: str,
+    language: str,
+    cycle_nodes: List[str],
+    edge_reports: Sequence[str],
+    aux_context: str = "",
+    synthesizer_variant_id: str = "S0",
+) -> str:
+    language = require_language(language)
+    synthesizer_agent = Agent(name="synthesizer")
+    
+    user_prompt = build_synthesizer_user_prompt(
+        client=client,
+        language=language,
+        cycle_nodes=cycle_nodes,
+        edge_reports=edge_reports,
+        aux_context=aux_context,
+        synthesizer_variant_id=synthesizer_variant_id,
+    )
+    
+    return synthesizer_agent.ask(
+        client=client,
+        transcript_path=transcript_path,
+        user_prompt=user_prompt,
+        min_output_tokens_reserved=3334,
+        safety_margin_tokens=1000,
+    )
+```
+
+### Token budgeting
+
+From `explain_AS/agents/synthesizer.py:50-69`:
+
+```python
+budget_items = normalized_edge_reports + [normalized_aux_text]
+budget_item_needs_tokens = [estimate_tokens_from_text(item_text) for item_text in budget_items]
+
+budget_item_allocations_tokens = allocate_token_budgets_even_share_with_redistribution(
+    item_token_needs=budget_item_needs_tokens,
+    total_tokens=int(total_input_tokens_budget),
+)
+```
+
+<Info>
+  **Even-share redistribution:** Each edge report gets an equal share of the budget. Unused tokens from short reports are redistributed to longer reports.
+</Info>
+
+### Prompt structure
+
+```text
+{synthesizer_variant_preamble}
+
+---
+
+{language_semantics}
+
+Cycle:
+{cycle_chain}
+
+Edge reports (in cycle order, may be truncated):
+
+--- Edge report 1 ---
+{edge_report_1}
+
+--- Edge report 2 ---
+{edge_report_2}
+
+...
+
+Optional additional context (may be truncated):
+{aux_context}
+
+{output_headings}
+```
+
+## Boundary agent
+
+**File:** `explain_AS/agents/boundary.py`
+
+**Role:** Infer likely architectural boundaries from file paths and external connections.
+
+### Responsibility
+
+The boundary agent analyzes:
+- File paths of nodes in the cycle
+- Incoming edges from outside the cycle
+- Outgoing edges to outside the cycle
+
+It produces **heuristic** boundary inferences based on path patterns (e.g., `src/domain`, `src/persistence`).
+
+<Note>
+  The boundary agent operates on **path names only**, not source code. It's a lightweight heuristic complement to code-based analysis.
+</Note>
+
+### Implementation
+
+From `explain_AS/agents/boundary.py:235-260`:
+
+```python
+def run_boundary_agent(
+    *,
+    client: LLMClient,
+    transcript_path: str,
+    language: str,
+    cycle_nodes: List[str],
+    scc_edges: List[SCCEdge],
+) -> str:
+    language = require_language(language)
+    boundary_agent = Agent(name="boundary")
+    
+    user_prompt = build_boundary_user_prompt(
+        language=language,
+        cycle_nodes=cycle_nodes,
+        scc_edges=scc_edges,
+        context_length=int(client.context_length),
+    )
+    
+    return boundary_agent.ask(
+        client=client,
+        transcript_path=transcript_path,
+        user_prompt=user_prompt,
+        min_output_tokens_reserved=2000,
+        safety_margin_tokens=1000,
+    )
+```
+
+### External connections summary
+
+From `explain_AS/agents/boundary.py:106-172`, the agent receives a structured summary:
+
+```text
+src/domain/user.py
+- Outgoing outside-cycle: 3 total
+  - By folder: src/utils (2), src/config (1)
+  - Samples:
+    - src/utils/validation.py
+    - src/utils/logging.py
+    - src/config/settings.py
+- Incoming outside-cycle: 5 total
+  - By folder: src/api (4), src/cli (1)
+  - Samples:
+    - src/api/user_controller.py
+    - src/api/auth_controller.py
+    - ...
+```
+
+<Tip>
+  The boundary agent is enabled by setting `auxiliary_agent: boundary` in the mode configuration.
+</Tip>
+
+## Graph agent
+
+**File:** `explain_AS/agents/graph.py`
+
+**Role:** Summarize how the cycle sits within its strongly connected component (SCC).
+
+### Responsibility
+
+The graph agent receives:
+- The full SCC containing the cycle (all nodes and edges)
+- The specific cycle being analyzed
+
+It identifies:
+- Hubs and bridges within the SCC
+- External connections at the SCC level
+- Structural risks when breaking cycle edges
+
+### Implementation
+
+From `explain_AS/agents/graph.py:79-104`:
+
+```python
+def run_graph_agent(
+    *,
+    client: LLMClient,
+    transcript_path: str,
+    language: str,
+    cycle_nodes: List[str],
+    scc_text: str,
+) -> str:
+    language = require_language(language)
+    graph_agent = Agent(name="graph")
+    
+    user_prompt = build_graph_user_prompt(
+        language=language,
+        cycle_nodes=cycle_nodes,
+        scc_text=scc_text,
+        context_length=int(client.context_length),
+    )
+    
+    return graph_agent.ask(
+        client=client,
+        transcript_path=transcript_path,
+        user_prompt=user_prompt,
+        min_output_tokens_reserved=2000,
+        safety_margin_tokens=1000,
+    )
+```
+
+### SCC context format
+
+From `explain_AS/engine.py:32-59`:
+
+```python
+def _build_scc_text_from_report(scc_report: Dict[str, Any], scc_id: str) -> str:
+    lines: List[str] = []
+    lines.append(f"SCC id: {scc_id}")
+    lines.append("")
+    lines.append("Nodes:")
+    for n in nodes:
+        lines.append(f"- {n}")
+    
+    lines.append("")
+    lines.append("Edges:")
+    for e in edges:
+        src = str(e.get("source") or "")
+        tgt = str(e.get("target") or "")
+        if src and tgt:
+            lines.append(f"- {src} -> {tgt}")
+    
+    return "\n".join(lines).strip()
+```
+
+<Tip>
+  The graph agent is enabled by setting `auxiliary_agent: graph` in the mode configuration.
+</Tip>
+
+## Review agent
+
+**File:** `explain_AS/agents/review.py`
+
+**Role:** Revise the synthesizer output for clarity and internal consistency.
+
+### Responsibility
+
+The review agent is a **finalizer** that:
+- Rewrites the synthesizer output to be clearer
+- Ensures internal consistency
+- Does NOT add new facts or interpretations
+- Does NOT include meta-commentary or critique
+
+<Note>
+  **Hard constraint:** The review agent must output ONLY the final revised explanation, not a review report.
+</Note>
+
+### Implementation
+
+From `explain_AS/agents/review.py:131-160`:
+
+```python
+def run_review_agent(
+    *,
+    client: LLMClient,
+    transcript_path: str,
+    language: str,
+    cycle_nodes: List[str],
+    edge_reports: Sequence[str],
+    synthesizer_text: str,
+    aux_context: str = "",
+) -> str:
+    language = require_language(language)
+    review_agent = Agent(name="review")
+    
+    user_prompt = build_review_user_prompt(
+        language=language,
+        cycle_nodes=cycle_nodes,
+        synthesizer_text=synthesizer_text,
+        edge_reports=edge_reports,
+        aux_context=aux_context,
+        context_length=int(client.context_length),
+    )
+    
+    return review_agent.ask(
+        client=client,
+        transcript_path=transcript_path,
+        user_prompt=user_prompt,
+        min_output_tokens_reserved=3667,
+        safety_margin_tokens=1000,
+    )
+```
+
+### Token budgeting priority
+
+From `explain_AS/agents/review.py:82-95`:
+
+```python
+# Priority:
+# 1) allocate as much as possible to synthesizer output
+# 2) remaining shared across edge reports + aux context
+synthesizer_tokens_needed = estimate_tokens_from_text(normalized_synthesizer_text)
+synthesizer_tokens_allocated = min(int(synthesizer_tokens_needed), int(total_input_tokens_budget))
+remaining_tokens_for_evidence = max(0, int(total_input_tokens_budget) - int(synthesizer_tokens_allocated))
+```
+
+<Info>
+  The review agent prioritizes the synthesizer output in its token budget, treating edge reports as secondary evidence.
+</Info>
+
+### Prompt preamble
+
+From `explain_AS/agents/review.py:19-28`:
+
+```python
+REVIEW_PROMPT_PREAMBLE = """You are the Reviewer Agent.
+You are a finalizer: rewrite the synthesizer output to be clearer and internally consistent.
+
+Hard rules:
+- Do NOT add new facts.
+- Do NOT include meta commentary, critiques, or headings like "Issues found" or "Suggested revisions".
+- Output ONLY the final revised cycle explanation, in the requested output format.
+- No tables, no JSON.
+- If you see truncation notes, assume some context may be missing.
+""".strip()
+```
+
+<Tip>
+  The review agent is enabled by setting `auxiliary_agent: review` in the mode configuration.
+</Tip>
+
+## Agent execution guarantees
+
+### Token budgets
+
+All agents enforce strict token budgets to fit within the LLM context window:
+
+| Agent | Min Output | Safety Margin | Total Reserved |
+|-------|-----------|---------------|----------------|
+| Edge | 2000 | 1000 | 3000 |
+| Synthesizer | 3334 | 1000 | 4334 |
+| Boundary | 2000 | 1000 | 3000 |
+| Graph | 2000 | 1000 | 3000 |
+| Review | 3667 | 1000 | 4667 |
+
+### Truncation handling
+
+From `explain_AS/budgeting.py`, the framework uses:
+
+- **Hard caps:** 40,000 characters per file before token budgeting
+- **Soft truncation:** Token-based truncation with "[TRUNCATED]" markers
+- **Redistribution:** Unused token budget from small inputs is reallocated
+
+### Error handling
+
+From `explain_AS/llm.py`, the `Agent.ask()` method:
+
+1. Validates token budgets before making the LLM call
+2. Implements retry logic with exponential backoff
+3. Returns exit code 42 on LLM unavailability
+4. Writes transcript logs for debugging
+
+## Auxiliary agent selection
+
+Only **one** auxiliary agent can be active at a time:
+
+```python
+# From explain_AS/engine.py:79-87
+def _get_auxiliary_agent(params: Dict[str, Any]) -> str:
+    aux = str(params.get("auxiliary_agent") or "none").strip().lower()
+    if aux not in {"none", "boundary", "graph", "review"}:
+        raise ValueError(f"auxiliary_agent must be one of none|boundary|graph|review")
+    return aux
+```
+
+<Accordion title="Which auxiliary agent should I use?">
+  - **none:** Default; synthesizer uses only edge reports
+  - **boundary:** When architectural layer violations are suspected
+  - **graph:** When SCC structure and hubs are important
+  - **review:** When explanation consistency is critical (research quality)
+</Accordion>
+
+## Minimal orchestrator mode
+
+From `explain_AS/engine.py:90-93`, the framework also supports a minimal mode:
+
+```python
+def _run_minimal(*, cycle: Dict[str, Any], language: str) -> ExplainEngineResult:
+    cycle_nodes = filtered_cycle_nodes([str(n) for n in (cycle.get("nodes") or [])], skip_init=True)
+    prompt = build_minimal_prompt(cycle_nodes, language)
+    return ExplainEngineResult(cycle_nodes=cycle_nodes, final_prompt_text=prompt)
+```
+
+Minimal mode:
+- Skips all LLM calls
+- Generates a basic prompt with cycle structure only
+- Useful for testing or baseline comparisons
+
+<Tip>
+  Set `orchestrator: minimal` in mode configuration to use minimal mode.
+</Tip>

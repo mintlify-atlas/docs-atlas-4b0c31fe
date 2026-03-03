@@ -1,0 +1,259 @@
+---
+title: llm
+description: Run explain and openhands phases sequentially
+---
+
+Combined command that runs both the explain and openhands phases in sequence. This is the primary workflow command for LLM-driven ATD refactoring after baseline has been established.
+
+## Usage
+
+```bash
+python3 -m atd_pipeline.cli llm -c <config_file> [--modes MODE1 MODE2 ...]
+```
+
+Or using the wrapper script:
+
+```bash
+scripts/run_llm.sh -c pipeline.yaml
+```
+
+## Parameters
+
+<ParamField path="config" type="Path" required>
+  Path to the pipeline configuration YAML file.
+  
+  **Flags:** `-c`, `--config`
+  
+  **Example:** `-c pipeline.yaml`
+</ParamField>
+
+<ParamField path="modes" type="List[str]" default="all modes">
+  Filter which experimental modes to run for both phases.
+  
+  **Flag:** `--modes`
+  
+  **Example:** `--modes gpt4-explain claude-explain`
+</ParamField>
+
+## What it does
+
+The llm command executes:
+
+1. **Explain phase** - Generates refactoring prompts using LLM
+   - Loads baseline cycle catalogs
+   - Invokes LLM to analyze cycles
+   - Writes `prompt.txt` for each unit
+
+2. **OpenHands phase** - Executes automated refactoring
+   - Reads generated prompts
+   - Creates refactor branches
+   - Applies LLM-driven code changes
+   - Commits successful refactorings
+
+## Equivalent to
+
+Running llm is equivalent to:
+
+```bash
+python3 -m atd_pipeline.cli explain -c pipeline.yaml --modes MODE1 MODE2
+python3 -m atd_pipeline.cli openhands -c pipeline.yaml --modes MODE1 MODE2
+```
+
+## Prerequisites
+
+<Warning>
+Baseline must be completed first:
+```bash
+python3 -m atd_pipeline.cli baseline -c pipeline.yaml
+```
+</Warning>
+
+Required artifacts:
+- `ATD_identification/scc_report.json` (from baseline)
+- `ATD_identification/cycle_catalog.json` (from baseline)
+
+## Examples
+
+<CodeGroup>
+
+```bash Full LLM workflow
+# 1. Run baseline once
+scripts/run_baseline.sh -c pipeline.yaml
+
+# 2. Run LLM phases (explain + openhands)
+scripts/run_llm.sh -c pipeline.yaml
+
+# 3. Collect metrics
+scripts/run_metrics.sh -c pipeline.yaml
+```
+
+```bash Specific modes
+python3 -m atd_pipeline.cli llm -c pipeline.yaml --modes gpt4-refactor
+```
+
+```bash Multiple modes
+python3 -m atd_pipeline.cli llm -c pipeline.yaml --modes gpt4 claude gemini
+```
+
+```bash Custom LLM endpoint
+ATD_LLM_URL="http://localhost:8000/v1" \
+  python3 -m atd_pipeline.cli llm -c pipeline.yaml
+```
+
+</CodeGroup>
+
+## Stop-on-block behavior
+
+Both phases use `stop_on_llm_blocked=True` by default:
+
+- If **explain** is blocked (LLM unavailable), the command stops immediately
+- If **openhands** is blocked, the command stops immediately
+- Prevents wasting time on phases that cannot complete without LLM
+
+<Note>
+To continue on blocks, run explain and openhands separately and modify the `stop_on_llm_blocked` parameter in code.
+</Note>
+
+## Environment variables
+
+Both phases respect:
+
+- **ATD_LLM_URL** - Override LLM endpoint URL
+- **ATD_LLM_BASE_URL** - Override LLM base URL
+- **ATD_MODE_PARAMS_JSON** - Mode-specific parameters (auto-set)
+
+## Output structure
+
+```
+<results_root>/<repo>/<experiment_branch>/
+├── explain/
+│   └── prompt.txt              # From explain phase
+├── openhands/
+│   ├── status.json             # From openhands phase
+│   └── trajectory.json
+├── _phase_explain.json         # Explain status
+└── _phase_openhands.json       # OpenHands status
+```
+
+## Status tracking
+
+Each phase writes its own status file:
+
+**_phase_explain.json:**
+```json
+{
+  "phase": "explain",
+  "execution_id": "...",
+  "outcome": "ok",
+  "artifacts": {
+    "prompt": "/path/to/prompt.txt"
+  }
+}
+```
+
+**_phase_openhands.json:**
+```json
+{
+  "phase": "openhands",
+  "execution_id": "...",
+  "outcome": "ok",
+  "openhands_outcome": "committed",
+  "artifacts": {
+    "openhands_dir": "/path/to/openhands"
+  }
+}
+```
+
+## Failure handling
+
+### Explain failures
+
+If explain fails:
+- OpenHands is **skipped** for affected units
+- Other units continue normally
+- Check explain status and logs
+
+### OpenHands failures
+
+If openhands fails:
+- Marked as failed in status
+- No metrics will be collected (skipped)
+- Refactor branch may be incomplete
+
+## Complete pipeline example
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+CONFIG="experiments/my_experiment.yaml"
+
+# Step 1: Baseline (run once per repository)
+echo "Running baseline..."
+python3 -m atd_pipeline.cli baseline -c "$CONFIG"
+
+# Step 2: LLM phases (explain + openhands)
+echo "Running LLM refactoring..."
+python3 -m atd_pipeline.cli llm -c "$CONFIG"
+
+# Step 3: Metrics collection
+echo "Collecting metrics..."
+python3 -m atd_pipeline.cli metrics -c "$CONFIG"
+
+echo "Pipeline complete!"
+```
+
+## Configuration example
+
+Define modes in your pipeline config:
+
+```yaml
+experiment_id: atd_experiment_001
+
+llm:
+  model: gpt-4-turbo
+  base_url: https://api.openai.com/v1
+  api_key_env: OPENAI_API_KEY
+
+modes:
+  - name: gpt4-refactor
+    params:
+      temperature: 0.2
+      max_tokens: 4000
+      
+  - name: claude-refactor
+    params:
+      model: claude-3-sonnet
+      temperature: 0.3
+```
+
+## Performance considerations
+
+- **Parallel processing** - Units run sequentially by default
+- **LLM rate limits** - May cause blocks; implement backoff
+- **Branch operations** - Git checkout can be slow for large repos
+- **Explain caching** - Prompts are cached; re-running openhands uses existing prompts
+
+<Note>
+To re-generate prompts, delete the `explain/` directory or run explain phase separately.
+</Note>
+
+## Implementation
+
+See `atd_pipeline/cli.py:468` for the llm command implementation:
+
+```python
+@app.command()
+def llm(
+    config: Path = typer.Option(..., "-c", "--config", exists=True, dir_okay=False),
+    modes: Optional[List[str]] = typer.Option(None, "--modes"),
+):
+    pipeline_config, experiment_units = _load_config_and_tasks(
+        config,
+        modes,
+        require_baseline=True,
+        require_cycle_catalogs=True,
+    )
+    run_explain_phase(pipeline_config, experiment_units)
+    run_openhands_phase(pipeline_config, experiment_units)
+```

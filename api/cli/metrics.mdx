@@ -1,0 +1,210 @@
+---
+title: metrics
+description: Collect post-refactoring metrics from completed branches
+---
+
+Collects metrics from refactored branches to evaluate the impact of ATD resolution. Analyzes dependency graphs, code quality, and structural changes after OpenHands completes refactoring.
+
+## Usage
+
+```bash
+python3 -m atd_pipeline.cli metrics -c <config_file> [--modes MODE1 MODE2 ...]
+```
+
+Or using the wrapper script:
+
+```bash
+scripts/run_metrics.sh -c pipeline.yaml
+```
+
+## Parameters
+
+<ParamField path="config" type="Path" required>
+  Path to the pipeline configuration YAML file.
+  
+  **Flags:** `-c`, `--config`
+  
+  **Example:** `-c pipeline.yaml`
+</ParamField>
+
+<ParamField path="modes" type="List[str]" default="all modes">
+  Filter which experimental modes to collect metrics for.
+  
+  **Flag:** `--modes`
+  
+  **Example:** `--modes gpt4-explain claude-explain`
+</ParamField>
+
+## What it does
+
+For each experiment unit with a successful openhands outcome:
+
+1. **Validates openhands status** - Checks that refactoring was committed
+2. **Checks out refactor branch** - Switches to the branch with changes
+3. **Extracts dependency graph** - Re-analyzes code structure
+4. **Computes SCC metrics** - Measures remaining circular dependencies
+5. **Collects code quality** - Runs linters and quality tools on refactored code
+6. **Generates quality summary** - Creates comparative metrics
+7. **Optionally deletes branch** - Based on policy configuration
+
+## Output structure
+
+```
+<results_root>/<repo>/<experiment_branch>/
+├── ATD_identification/
+│   ├── dependency_graph.json     # Post-refactor graph
+│   └── scc_report.json           # Post-refactor cycles
+├── code_quality_checks/
+│   ├── metrics.json              # Quality metrics
+│   └── [various reports]
+└── _phase_metrics.json           # Phase status
+```
+
+## Prerequisites
+
+Metrics requires a successful openhands execution:
+
+```bash
+# 1. Baseline
+python3 -m atd_pipeline.cli baseline -c pipeline.yaml
+
+# 2. Explain
+python3 -m atd_pipeline.cli explain -c pipeline.yaml
+
+# 3. OpenHands
+python3 -m atd_pipeline.cli openhands -c pipeline.yaml
+
+# 4. Metrics
+python3 -m atd_pipeline.cli metrics -c pipeline.yaml
+```
+
+## Status outcomes
+
+### Success (ok)
+- Metrics collected successfully
+- All analysis scripts completed
+- Output files written
+
+### Skipped conditions
+
+<ParamField path="skipped_missing_openhands_status" type="skipped">
+  OpenHands did not run or did not write status.json.
+</ParamField>
+
+<ParamField path="skipped_openhands_outcome_*" type="skipped">
+  OpenHands outcome was not "committed" (e.g., `no_changes`, `failed`, `blocked`).
+</ParamField>
+
+<ParamField path="skipped_missing_branch" type="skipped">
+  Refactor branch does not exist locally (may have been deleted prematurely).
+</ParamField>
+
+## Examples
+
+<CodeGroup>
+
+```bash Collect all metrics
+python3 -m atd_pipeline.cli metrics -c pipeline.yaml
+```
+
+```bash Specific modes only
+python3 -m atd_pipeline.cli metrics -c pipeline.yaml --modes gpt4-explain
+```
+
+```bash Using wrapper script
+scripts/run_metrics.sh -c pipeline.yaml
+```
+
+```bash Full pipeline
+scripts/run_baseline.sh -c pipeline.yaml
+scripts/run_llm.sh -c pipeline.yaml
+scripts/run_metrics.sh -c pipeline.yaml
+```
+
+</CodeGroup>
+
+## Command invocation
+
+The metrics phase internally calls:
+
+```bash
+bash scripts/branch_metrics_collect.sh \
+  /path/to/repo \
+  refactor_branch \
+  src_entry \
+  /path/to/results_dir \
+  base_branch \
+  language
+```
+
+## Branch cleanup policy
+
+Configure branch deletion in your pipeline config:
+
+```yaml
+policy:
+  delete_refactor_branches_after_metrics: true
+```
+
+When enabled:
+- Branches are deleted **after successful metrics collection**
+- Only deletes branches matching the experiment pattern
+- Preserves branches if metrics collection fails
+
+<Warning>
+Set to `false` during development to preserve branches for inspection.
+</Warning>
+
+## Comparing baseline vs refactored
+
+After metrics collection, compare results:
+
+**Baseline location:**
+```
+results/<repo>/<base_branch>/ATD_identification/scc_report.json
+```
+
+**Refactored location:**
+```
+results/<repo>/<experiment_branch>/ATD_identification/scc_report.json
+```
+
+Key metrics to compare:
+- Number of SCCs (strongly connected components)
+- Cycle complexity (nodes per cycle)
+- Code quality scores (pylint, complexity)
+- Line counts and structure metrics
+
+## Error handling
+
+If metrics collection fails:
+
+1. **Status marked as failed** with error details
+2. **Branch is preserved** (not deleted on failure)
+3. **Execution continues** to remaining units
+4. **Check logs** in the branch results directory
+
+## Missing branch handling
+
+If the refactor branch doesn't exist:
+
+- Creates `_status_missing_branch.json` marker
+- Marks unit as skipped
+- Does not fail the entire metrics phase
+
+<Note>
+This can happen if branches are deleted outside the pipeline or if git operations fail.
+</Note>
+
+## Language support
+
+Metrics collection supports:
+
+- **Python** - AST analysis, pylint, radon, coverage
+- **C#** - Roslyn analysis, dotnet tools, code metrics
+
+Language is specified in the repository configuration and determines which analysis tools are invoked.
+
+## Implementation
+
+See `atd_pipeline/cli.py:301` for the `run_metrics_phase` function and `cli.py:453` for the command definition.

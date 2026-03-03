@@ -1,0 +1,259 @@
+---
+title: LLM endpoint configuration
+description: Configure OpenAI-compatible LLM endpoints for explanation and refactoring agents
+---
+
+The `llm` section of the pipeline configuration specifies the LLM endpoint used by both the multi-agent explanation team and OpenHands for code refactoring.
+
+## Overview
+
+The pipeline requires an OpenAI-compatible LLM endpoint that supports the `/v1/chat/completions` API. The endpoint must be reachable from inside Docker containers and does not require authentication beyond an API key.
+
+<Note>
+  Users must provide their own LLM endpoint. The pipeline does not include a bundled LLM server.
+</Note>
+
+## Configuration
+
+```yaml
+llm:
+  base_url: "http://host.docker.internal:8012/v1"
+  api_key: "placeholder"
+  model_raw: "Qwen3-Coder-30B-A3B-Instruct"
+  context_length: 32768
+```
+
+## Parameters
+
+<ParamField path="llm.base_url" type="string" required>
+  Base URL of the OpenAI-compatible LLM endpoint. Must include the `/v1` suffix and be accessible from inside Docker containers.
+  
+  **Format:** `http(s)://host:port/v1`
+  
+  **Example:** `http://host.docker.internal:8012/v1`
+  
+  <Note>
+    Use `host.docker.internal` to access services running on the host machine from inside Docker containers.
+  </Note>
+</ParamField>
+
+<ParamField path="llm.api_key" type="string" required>
+  API key for authenticating with the LLM endpoint. This value is passed in the `Authorization: Bearer` header.
+  
+  **Example:** `placeholder` (for endpoints that don't require authentication)
+</ParamField>
+
+<ParamField path="llm.model_raw" type="string" required>
+  Model identifier sent to the LLM endpoint. The exact format depends on your LLM provider.
+  
+  **Example:** `Qwen3-Coder-30B-A3B-Instruct`
+  
+  This could be:
+  - A model name (e.g., `gpt-4`, `claude-3-opus`)
+  - A path to a local model (e.g., `/path/to/model`)
+  - A HuggingFace model identifier
+</ParamField>
+
+<ParamField path="llm.context_length" type="integer" required>
+  Maximum context length supported by the model, in tokens. Used to prevent exceeding model limits when constructing prompts.
+  
+  **Example:** `32768`
+  
+  Common values:
+  - 4096 (older models)
+  - 8192 (mid-range models)
+  - 32768 (long-context models)
+  - 128000+ (extended context models)
+</ParamField>
+
+## Docker networking
+
+The LLM endpoint must be accessible from inside Docker containers. The recommended approach depends on where your LLM server is running:
+
+### LLM on host machine
+
+Use `host.docker.internal` to access the host from inside containers:
+
+```yaml
+llm:
+  base_url: "http://host.docker.internal:8012/v1"
+```
+
+This requires starting the container with `--add-host=host.docker.internal:host-gateway`:
+
+```bash
+docker run --rm -it \
+  --add-host=host.docker.internal:host-gateway \
+  ...
+```
+
+### LLM in another container
+
+Use Docker networking to connect containers:
+
+```yaml
+llm:
+  base_url: "http://llm-server:8012/v1"
+```
+
+### LLM on remote server
+
+Use the full URL:
+
+```yaml
+llm:
+  base_url: "https://api.example.com/v1"
+  api_key: "your-actual-api-key"
+```
+
+## API compatibility
+
+The LLM endpoint must implement the OpenAI chat completions API:
+
+```
+POST {base_url}/chat/completions
+Content-Type: application/json
+Authorization: Bearer {api_key}
+
+{
+  "model": "{model_raw}",
+  "messages": [...],
+  "temperature": 0.7,
+  "max_tokens": 2000
+}
+```
+
+### Required response format
+
+```json
+{
+  "choices": [
+    {
+      "message": {
+        "role": "assistant",
+        "content": "..."
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 100,
+    "completion_tokens": 50,
+    "total_tokens": 150
+  }
+}
+```
+
+## Usage in pipeline
+
+The LLM configuration is used in two contexts:
+
+### 1. Explanation phase
+
+The multi-agent explanation team uses the LLM endpoint to generate cycle explanations. Each agent makes multiple API calls to analyze code and synthesize findings.
+
+### 2. Refactoring phase
+
+OpenHands uses the LLM endpoint to generate refactoring actions. The endpoint is passed to OpenHands via environment variables:
+
+```python
+os.environ["LLM_BASE_URL"] = config.llm.base_url
+os.environ["LLM_API_KEY"] = config.llm.api_key
+os.environ["LLM_MODEL"] = config.llm.model_raw
+```
+
+## Validation
+
+The configuration loader validates:
+
+<ParamField path="llm.base_url" type="string" required>
+  Must be a non-empty string after trimming whitespace.
+</ParamField>
+
+<ParamField path="llm.api_key" type="string" required>
+  Must be a non-empty string after trimming whitespace.
+</ParamField>
+
+<ParamField path="llm.model_raw" type="string" required>
+  Must be a non-empty string after trimming whitespace.
+</ParamField>
+
+<ParamField path="llm.context_length" type="integer" required>
+  Must be a positive integer.
+</ParamField>
+
+<Warning>
+  If any required field is missing or invalid, the configuration loader will raise a `ValueError` with a descriptive error message.
+</Warning>
+
+## Example configurations
+
+### Local vLLM server
+
+```yaml
+llm:
+  base_url: "http://host.docker.internal:8000/v1"
+  api_key: "EMPTY"
+  model_raw: "codellama/CodeLlama-34b-Instruct-hf"
+  context_length: 16384
+```
+
+### OpenAI API
+
+```yaml
+llm:
+  base_url: "https://api.openai.com/v1"
+  api_key: "sk-..."
+  model_raw: "gpt-4-turbo-preview"
+  context_length: 128000
+```
+
+### Custom inference server
+
+```yaml
+llm:
+  base_url: "http://192.168.1.100:8080/v1"
+  api_key: "placeholder"
+  model_raw: "/models/custom-model"
+  context_length: 32768
+```
+
+## Troubleshooting
+
+### Connection refused
+
+If you see connection errors, verify:
+1. The LLM server is running and listening on the specified port
+2. The `--add-host=host.docker.internal:host-gateway` flag is set when starting the container
+3. Firewall rules allow connections from Docker containers
+
+### Model not found
+
+If you see model-related errors:
+1. Verify the `model_raw` value matches what your LLM server expects
+2. Check that the model is loaded and available
+3. Review the LLM server logs for details
+
+### Context length exceeded
+
+If prompts exceed the context length:
+1. Verify `context_length` matches your model's actual limit
+2. Consider using a model with longer context
+3. Reduce the size of input code or dependency graphs
+
+## LLMConfig class
+
+The LLM configuration is loaded into an `LLMConfig` dataclass defined in `/home/daytona/workspace/source/atd_pipeline/config.py:73-77`:
+
+```python
+@dataclass(frozen=True)
+class LLMConfig:
+    base_url: str
+    api_key: str
+    model_raw: str
+    context_length: int
+```
+
+## Related
+
+- [Complete YAML schema](/api/config/yaml-schema)
+- [OpenHands configuration](/api/config/openhands-config)

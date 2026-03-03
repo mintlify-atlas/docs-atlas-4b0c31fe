@@ -1,0 +1,221 @@
+---
+title: Graph agent
+description: Analyzes how a cycle sits within the SCC graph structure
+---
+
+The graph agent (also called structural context agent) analyzes the position of a dependency cycle within the larger strongly connected component (SCC) graph.
+
+## Overview
+
+The graph agent:
+
+- Summarizes how the cycle sits within the SCC
+- Identifies hub nodes and bridge files
+- Describes external connections visible in the graph
+- Assesses risks when breaking cycle edges
+- Stays factual based on provided SCC text
+- Operates on graph structure (nodes and edges)
+
+Output is typically used as auxiliary context for the [synthesizer agent](/api/agents/synthesizer-agent).
+
+## Function signature
+
+```python
+def run_graph_agent(
+    *,
+    client: LLMClient,
+    transcript_path: str,
+    language: str,
+    cycle_nodes: List[str],
+    scc_text: str,
+) -> str
+```
+
+Location: `explain_AS/agents/graph.py:79`
+
+## Parameters
+
+<ParamField path="client" type="LLMClient" required>
+  The LLM client instance for making API calls
+</ParamField>
+
+<ParamField path="transcript_path" type="str" required>
+  Path to the transcript file where conversation history is logged
+</ParamField>
+
+<ParamField path="language" type="str" required>
+  Programming language of the codebase (e.g., "Python", "TypeScript")
+</ParamField>
+
+<ParamField path="cycle_nodes" type="List[str]" required>
+  List of file paths forming the dependency cycle
+</ParamField>
+
+<ParamField path="scc_text" type="str" required>
+  Plain text representation of the SCC graph (nodes and edges)
+</ParamField>
+
+## Return value
+
+<ResponseField name="report" type="str">
+  A structured report with the following sections:
+  - **How the cycle sits in the SCC**: Position and relationship to larger SCC
+  - **Hubs / bridges (if any)**: Key nodes connecting components
+  - **External connections (if visible)**: Connections outside the SCC
+  - **Risks when breaking edges**: Potential impacts of cycle-breaking
+  - **Notes / uncertainty**: Caveats and limitations
+</ResponseField>
+
+## Configuration constants
+
+<ParamField path="GRAPH_MIN_OUTPUT_TOKENS_RESERVED" type="int" default="2000">
+  Token reservation for agent output
+</ParamField>
+
+<ParamField path="GRAPH_SAFETY_MARGIN_TOKENS" type="int" default="1000">
+  Safety margin to prevent context overflow
+</ParamField>
+
+## Prompt template
+
+The graph agent uses a fixed prompt preamble:
+
+```python
+GRAPH_PROMPT_PREAMBLE = """You are the Structural Context Agent.
+You receive the cycle and SCC graph context as plain text (nodes and edges).
+Your job is to summarize how the cycle sits within the SCC.
+
+Rules:
+- Stay factual based on provided SCC text.
+- No tables, no JSON.
+- Keep it short and focused.
+- If you see truncation notes, assume some context may be missing.
+"""
+```
+
+Location: `explain_AS/agents/graph.py:15`
+
+## Prompt building
+
+The `build_graph_user_prompt` function constructs the agent prompt:
+
+```python
+def build_graph_user_prompt(
+    *,
+    language: str,
+    cycle_nodes: List[str],
+    scc_text: str,
+    context_length: int,
+) -> str
+```
+
+Location: `explain_AS/agents/graph.py:27`
+
+### Token allocation logic
+
+1. Calculate total input budget after reserving output tokens and safety margin
+2. Estimate overhead from prompt prefix and suffix
+3. Allocate remaining budget to SCC text block
+4. Format SCC block with truncation if necessary
+5. Assemble final prompt
+
+<Note>
+If the SCC text is very large, it will be truncated to fit within the token budget. A truncation notice is added to alert the agent that some context may be missing.
+</Note>
+
+## Example usage
+
+<CodeGroup>
+```python Basic usage
+from agents.graph import run_graph_agent
+
+scc_text = """
+Nodes: 15
+Edges: 23
+
+src/domain/user.py -> src/database/models.py
+src/database/models.py -> src/handlers/user_handler.py
+src/handlers/user_handler.py -> src/domain/user.py
+...
+"""
+
+graph_report = run_graph_agent(
+    client=llm_client,
+    transcript_path="/tmp/transcript.jsonl",
+    language="Python",
+    cycle_nodes=[
+        "src/domain/user.py",
+        "src/database/models.py",
+        "src/handlers/user_handler.py",
+    ],
+    scc_text=scc_text,
+)
+```
+
+```python TypeScript example
+graph_report = run_graph_agent(
+    client=llm_client,
+    transcript_path="/tmp/transcript.jsonl",
+    language="TypeScript",
+    cycle_nodes=[
+        "src/service/auth.ts",
+        "src/model/user.ts",
+        "src/controller/auth.ts",
+    ],
+    scc_text=scc_graph_text,
+)
+```
+</CodeGroup>
+
+## SCC text format
+
+The `scc_text` parameter should contain a plain-text representation of the SCC graph. Common formats include:
+
+- Node and edge counts
+- Edge list (one edge per line)
+- Adjacency information
+- Any other graph structure representation
+
+Example:
+
+```
+Nodes: 8
+Edges: 12
+
+Edge list:
+file_a.py -> file_b.py
+file_b.py -> file_c.py
+file_c.py -> file_a.py
+file_a.py -> external.py
+...
+```
+
+## Prompt structure
+
+The graph prompt includes:
+
+1. **Preamble**: Agent role and rules
+2. **Edge semantics**: Language-specific dependency semantics
+3. **Cycle**: Pretty-printed cycle chain
+4. **SCC context**: Plain text graph structure (token-budgeted)
+5. **Output format**: Required section headings
+
+## Use cases
+
+The graph agent is particularly useful for:
+
+- Understanding if a cycle is the entire SCC or a subset
+- Identifying hub files that connect to many other nodes
+- Detecting bridge nodes that connect separate components
+- Assessing the blast radius of breaking a cycle edge
+- Evaluating whether breaking one cycle might create or expose others
+
+<Note>
+The graph agent analyzes only the structure provided in `scc_text`. It does not perform graph algorithms or additional analysis beyond interpreting the text.
+</Note>
+
+## Related agents
+
+- [Boundary agent](/api/agents/boundary-agent) - Provides architectural boundary insights
+- [Synthesizer agent](/api/agents/synthesizer-agent) - Consumes graph insights as auxiliary context
+- [Edge agent](/api/agents/edge-agent) - Provides code-level edge analysis

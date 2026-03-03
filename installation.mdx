@@ -1,0 +1,299 @@
+---
+title: Installation
+description: Install Python dependencies, Docker, and set up the multi-agent LLM framework for architectural refactoring experiments
+---
+
+# Installation
+
+Set up the multi-agent LLM framework for ATD on your system. This guide covers Python environment setup, Docker configuration, and repository preparation.
+
+<Warning>
+**Platform notice**: This framework was developed and tested on **Windows with WSL (Ubuntu) + Docker**. Other platforms have not been tested.
+
+The project **must** be stored in the Linux filesystem (not Windows filesystem when using WSL).
+</Warning>
+
+## Prerequisites
+
+<Steps>
+  <Step title="Operating system">
+    - Windows with WSL 2 (Ubuntu recommended)
+    - Or native Linux
+    - macOS compatibility unknown
+  </Step>
+  
+  <Step title="Python 3.12+">
+    Python 3.12 or higher is required.
+    
+    ```bash
+    python3 --version  # Should be 3.12+
+    ```
+  </Step>
+  
+  <Step title="Docker and Docker socket access">
+    Docker must be installed and accessible. OpenHands requires `/var/run/docker.sock` access.
+    
+    ```bash
+    docker --version
+    docker ps  # Should not error
+    ```
+  </Step>
+  
+  <Step title="Git">
+    Required for managing experiment branches.
+    
+    ```bash
+    git --version
+    ```
+  </Step>
+</Steps>
+
+## Clone the repository
+
+<Note>
+Make sure you clone into a directory **inside the Linux filesystem** (e.g., `~/projects/`), not a Windows mount like `/mnt/c/` if using WSL.
+</Note>
+
+Clone the framework source code:
+
+```bash
+cd ~
+mkdir -p projects
+cd projects
+git clone <repository-url> multi-agent-llm-framework-for-atd
+cd multi-agent-llm-framework-for-atd
+```
+
+## Build the Docker image
+
+The framework uses a custom Docker image with all dependencies pre-installed:
+
+- Python 3.12 with `uv` package manager
+- .NET SDKs (6.0, 8.0, 9.0, 10.0) for C# analysis
+- Java 17 for the Depends tool
+- Docker CLI for OpenHands nested containers
+- Code quality tools: Radon, Bandit, Lizard, Vulture, PyExamine
+
+### Build command
+
+```bash
+docker build --target dev -t atd-dev .
+```
+
+<Info>
+Build time: ~10-15 minutes depending on network speed. The image includes .NET SDKs and multiple analysis tools.
+</Info>
+
+The Dockerfile installs:
+
+- **Base tools**: Docker CLI, Git, rsync, curl, unzip
+- **Language runtimes**: Python 3.12, .NET 6/8/9/10, Java 17, Mono
+- **Python packages** (via `uv`):
+  - `openhands==1.12.2` - Automated refactoring agent
+  - `networkx>=3.5` - Graph analysis
+  - `pydeps>=3.0.1` - Python dependency extraction
+  - `radon>=6.0.1`, `bandit>=1.8.6`, `lizard>=1.21.2`, `vulture>=2.14` - Code quality
+  - `typer>=0.19.2` - CLI framework
+- **Depends tool**: Multi-language dependency analyzer (Java-based)
+- **PyExamine**: Python code smell detector
+
+### Verify the build
+
+```bash
+docker images atd-dev
+```
+
+You should see:
+
+```
+REPOSITORY   TAG       IMAGE ID       CREATED          SIZE
+atd-dev      latest    <image-id>     X minutes ago    ~3GB
+```
+
+## Python dependencies (development)
+
+If you want to run scripts **outside Docker** (optional), install dependencies locally:
+
+### Using uv (recommended)
+
+```bash
+# Install uv if not already installed
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Install dependencies
+uv sync
+
+# Activate virtual environment
+source .venv/bin/activate
+```
+
+### Using pip
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .
+```
+
+<Tip>
+**Most users should run everything inside Docker** and skip local Python installation. The Docker container has all tools configured correctly.
+</Tip>
+
+## Prepare subject systems
+
+The framework analyzes **local Git repositories** of subject systems. You must clone them manually.
+
+<Steps>
+  <Step title="Create projects directory">
+    ```bash
+    mkdir -p projects_to_analyze
+    ```
+  </Step>
+  
+  <Step title="Clone subject repositories">
+    Clone repositories you want to analyze into `projects_to_analyze/`.
+    
+    Example:
+    ```bash
+    cd projects_to_analyze
+    git clone https://github.com/MudBlazor/MudBlazor.git
+    cd MudBlazor
+    git checkout dev  # Use the base branch specified in repos.txt
+    cd ../..
+    ```
+  </Step>
+  
+  <Step title="Create repos.txt">
+    Create `repos.txt` with one line per repository:
+    
+    ```txt
+    <repo-name> <base-branch> <entry-directory> <language>
+    ```
+    
+    Example:
+    ```txt
+    MudBlazor dev src/MudBlazor csharp
+    ```
+    
+    Fields:
+    - `repo-name`: Directory name in `projects_to_analyze/`
+    - `base-branch`: Git branch to analyze
+    - `entry-directory`: Root directory for dependency analysis
+    - `language`: `python` or `csharp`
+  </Step>
+</Steps>
+
+<Note>
+The pipeline **never clones repositories automatically**. You must clone them manually and ensure they're at the correct branch before running baseline analysis.
+</Note>
+
+## Set up LLM endpoint
+
+The framework requires an **OpenAI-compatible LLM endpoint** for the multi-agent system and OpenHands.
+
+### Requirements
+
+- Must support `/v1/chat/completions` API
+- Must be reachable from inside Docker container
+- Use `http://host.docker.internal:<port>/v1` as base URL to reach host services
+
+### Example configuration
+
+Edit `configs/pipeline.yaml`:
+
+```yaml
+llm:
+  base_url: "http://host.docker.internal:8012/v1"
+  api_key: "placeholder"  # Or real key if using cloud API
+  model_raw: "gpt-4"  # Or local model path
+  context_length: 128000
+```
+
+<Warning>
+**No LLM endpoint = no experiments**. You must provide your own endpoint. The framework does not include an LLM.
+</Warning>
+
+### Local LLM options
+
+- **vLLM**: Fast local inference server (recommended)
+- **Ollama**: Easy local setup
+- **LM Studio**: GUI-based local server
+- **llama.cpp server**: Minimal C++ implementation
+
+### Cloud LLM options
+
+- OpenAI API
+- Anthropic Claude (via OpenAI-compatible proxy)
+- Azure OpenAI
+- Any OpenAI-compatible API
+
+<Tip>
+The framework includes `vllm_proxy.py` for running vLLM locally. Check the source code for usage.
+</Tip>
+
+## Start the Docker container
+
+Run the container with correct permissions and Docker socket access:
+
+```bash
+DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)
+
+docker run --rm -it \
+  --add-host=host.docker.internal:host-gateway \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v "$(pwd)":/workspace \
+  -w /workspace \
+  --name atd-dev \
+  --user "$(id -u):$(id -g)" \
+  --group-add "$DOCKER_GID" \
+  -e HOST_PWD="$(pwd)" \
+  atd-dev
+```
+
+### What this does
+
+- `--add-host=host.docker.internal:host-gateway`: Allows container to reach host LLM endpoint
+- `-v /var/run/docker.sock:/var/run/docker.sock`: OpenHands can launch nested containers
+- `-v "$(pwd)":/workspace`: Mounts current directory as `/workspace`
+- `--user "$(id -u):$(id -g)"`: Correct file ownership
+- `--group-add "$DOCKER_GID"`: Docker socket access
+
+<Info>
+You're now inside the container with all tools ready. The virtual environment is auto-activated.
+</Info>
+
+## Verify installation
+
+Inside the container, verify tools are available:
+
+<CodeGroup>
+
+```bash Python tools
+python3 --version  # Should be 3.12+
+which radon bandit lizard vulture
+pip show openhands
+```
+
+```bash .NET tools
+dotnet --list-sdks  # Should show 6.0, 8.0, 9.0, 10.0
+```
+
+```bash Depends tool
+depends-cli --help
+# Or:
+java -jar /opt/depends/depends*.jar --help
+```
+
+```bash Docker access
+docker ps  # Should list running containers
+```
+
+</CodeGroup>
+
+If all commands succeed, you're ready to run experiments.
+
+## Next steps
+
+<Card title="Quick start guide" icon="rocket" href="/quickstart">
+  Run your first baseline analysis and cycle detection
+</Card>

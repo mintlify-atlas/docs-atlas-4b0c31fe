@@ -1,80 +1,448 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quick start
+description: Run your first baseline analysis, detect dependency cycles, and execute a multi-agent LLM refactoring experiment
 ---
 
-## Get started in three steps
+# Quick start
 
-Get your documentation site running locally and make your first customization.
+Get started with the multi-agent LLM framework by running a complete experiment: baseline analysis, cycle selection, multi-agent explanation, and automated refactoring.
 
-### Step 1: Set up your local environment
+<Note>
+This guide assumes you've completed [installation](/installation) and have the Docker container running.
+</Note>
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
+## Overview
+
+You'll run through the full pipeline:
+
+1. **Baseline analysis** - Extract dependency graphs and identify cycles
+2. **Cycle selection** - Choose architectural cycles to refactor
+3. **Multi-agent explanation** - LLM team analyzes selected cycles
+4. **Automated refactoring** - OpenHands applies fixes
+5. **Metrics collection** - Evaluate refactoring results
+
+## Prerequisites
+
+<Steps>
+  <Step title="Docker container running">
+    You should be inside the `atd-dev` container:
+    ```bash
+    docker run --rm -it \
+      --add-host=host.docker.internal:host-gateway \
+      -v /var/run/docker.sock:/var/run/docker.sock \
+      -v "$(pwd)":/workspace \
+      -w /workspace \
+      --name atd-dev \
+      --user "$(id -u):$(id -g)" \
+      --group-add "$(stat -c '%g' /var/run/docker.sock)" \
+      -e HOST_PWD="$(pwd)" \
+      atd-dev
+    ```
+  </Step>
+  
+  <Step title="Subject system cloned">
+    At least one repository cloned in `projects_to_analyze/`:
+    ```bash
+    ls projects_to_analyze/
+    # Should show your cloned repositories
+    ```
+  </Step>
+  
+  <Step title="Configuration file ready">
+    `configs/pipeline.yaml` exists with valid LLM endpoint configuration.
+  </Step>
+</Steps>
+
+## Step 1: Configure the experiment
+
+Create or edit `configs/pipeline.yaml`:
+
+```yaml
+projects_dir: projects_to_analyze
+repos_file: repos.txt
+cycles_file: cycles_to_analyze.txt
+results_root: results
+experiment_id: quickstart_exp
+
+policy:
+  delete_refactor_branches_after_metrics: false
+
+llm:
+  base_url: "http://host.docker.internal:8012/v1"
+  api_key: "placeholder"
+  model_raw: "gpt-4"  # Or your model name
+  context_length: 128000
+
+openhands:
+  runtime_image: "docker.all-hands.dev/all-hands-ai/runtime:0.59-nikolaik"
+  max_iters: 100
+  commit_message: "Refactor: break dependency cycle"
+
+modes:
+  - id: minimal
+    params:
+      orchestrator: minimal
+
+  - id: multi_agent_baseline
+    params:
+      orchestrator: multi_agent
+      edge_variant: E0
+      synthesizer_variant: S0
+      auxiliary_agent: none
+
+  - id: multi_agent_with_boundary
+    params:
+      orchestrator: multi_agent
+      edge_variant: E1
+      synthesizer_variant: S0
+      auxiliary_agent: boundary
+```
+
+<Info>
+**Configuration breakdown**:
+- `projects_dir`: Where subject repositories live
+- `repos_file`: List of repositories to analyze
+- `cycles_file`: Output from cycle selection (generated in Step 3)
+- `experiment_id`: Unique identifier for this experiment run
+- `modes`: Different multi-agent configurations to compare
+</Info>
+
+## Step 2: Run baseline analysis
+
+Extract dependency graphs and identify strongly connected components (SCCs):
+
+```bash
+scripts/run_baseline.sh -c configs/pipeline.yaml
+```
+
+### What happens
+
+<Steps>
+  <Step title="Dependency extraction">
+    Uses [Depends tool](https://github.com/multilang-depends/depends) to extract module-level dependencies for each repository.
     
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
+    For Python: Analyzes `.py` files  
+    For C#: Analyzes `.cs` files and `.csproj` projects
+  </Step>
+  
+  <Step title="Graph construction">
+    Builds directed graphs where:
+    - Nodes = modules (files or classes)
+    - Edges = dependencies (imports, references)
+  </Step>
+  
+  <Step title="SCC detection">
+    Identifies strongly connected components using Tarjan's algorithm. Each SCC represents a dependency cycle.
+  </Step>
+  
+  <Step title="Baseline metrics">
+    Computes architectural metrics:
+    - Number of SCCs
+    - SCC sizes
+    - Graph density
+    - Module coupling metrics
+  </Step>
+</Steps>
+
+### Expected output
+
+```
+[baseline] Processing MudBlazor (dev branch)
+[baseline] Running depends-cli on src/MudBlazor
+[baseline] Extracting SCCs from dependency graph
+[baseline] Found 5 non-trivial SCCs
+[baseline] Computing baseline metrics
+[baseline] Results written to results/quickstart_exp/MudBlazor/dev/baseline/
+```
+
+### Output files
+
+Baseline results are stored in `results/<experiment_id>/<repo>/<branch>/baseline/`:
+
+- `dependency_graph.json` - Full dependency graph
+- `scc_report.json` - List of SCCs with nodes and edges
+- `baseline_metrics.json` - Architectural metrics
+- `depends_output/` - Raw output from Depends tool
+
+<Tip>
+Inspect `scc_report.json` to see all detected dependency cycles before selecting which ones to refactor.
+</Tip>
+
+## Step 3: Select cycles to analyze
+
+Build a catalog of architectural cycles and select a subset:
+
+```bash
+scripts/build_cycles_to_analyze.sh -c configs/pipeline.yaml \
+  --total 10 \
+  --min-size 2 \
+  --max-size 8 \
+  --out cycles_to_analyze.txt
+```
+
+### Parameters
+
+- `--total 10`: Select 10 cycles total
+- `--min-size 2`: Only cycles with ≥2 nodes
+- `--max-size 8`: Only cycles with ≤8 nodes (larger cycles are too complex)
+- `--out cycles_to_analyze.txt`: Output file
+
+<Warning>
+**Cycle size matters**: Cycles with >10 nodes are often too complex for LLMs to analyze effectively. Start with smaller cycles (2-8 nodes).
+</Warning>
+
+### Output format
+
+`cycles_to_analyze.txt` contains one cycle per line:
+
+```txt
+MudBlazor dev scc_0_cycle_3
+MudBlazor dev scc_1_cycle_7
+MudBlazor dev scc_2_cycle_12
+```
+
+Format: `<repo> <branch> <cycle-id>`
+
+## Step 4: Run multi-agent explanation
+
+<Note>
+**Prerequisite**: Your LLM endpoint must be running and accessible at the `base_url` specified in `configs/pipeline.yaml`.
+</Note>
+
+Run the multi-agent LLM team to explain selected cycles:
+
+```bash
+scripts/run_llm.sh -c configs/pipeline.yaml \
+  --modes multi_agent_baseline \
+  --modes multi_agent_with_boundary
+```
+
+### What happens
+
+<Steps>
+  <Step title="Context loading">
+    For each cycle, loads:
+    - Module source code
+    - Dependency edges
+    - SCC structure
+  </Step>
+  
+  <Step title="Edge analysis">
+    **Edge agents** analyze each dependency in the cycle:
     
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 2: Deploy your changes
-
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
+    - **E0 variant**: Basic dependency analysis
+    - **E1 variant**: Detailed import analysis with code snippets
+    - **E2 variant**: Full function-level analysis
+  </Step>
+  
+  <Step title="Auxiliary agents" icon="users">
+    Optional agents provide additional context:
     
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+    - **Boundary agent**: Analyzes module interfaces and suggests extraction targets
+    - **Graph agent**: Provides graph-theoretic properties
+    - **Review agent**: Critiques the explanation for correctness
+  </Step>
+  
+  <Step title="Synthesis">
+    **Synthesizer agent** combines all analyses into a coherent explanation:
+    
+    - **S0 variant**: Direct synthesis from edge reports
+    - **S1 variant**: Adds architectural reasoning
+    - **S2 variant**: Includes refactoring strategy recommendations
+  </Step>
+  
+  <Step title="OpenHands refactoring">
+    OpenHands receives:
+    ```
+    Task: Break the dependency cycle in <module list>
+    
+    Context: <LLM-generated explanation>
+    
+    Instructions: Refactor the code to eliminate the cycle while preserving functionality.
+    ```
+    
+    OpenHands autonomously:
+    - Creates a Git worktree and local branch
+    - Edits source files
+    - Runs tests (if available)
+    - Commits changes locally
+  </Step>
+</Steps>
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+### Expected output
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+```
+[explain] Processing MudBlazor/dev/scc_0_cycle_3 with mode multi_agent_baseline
+[explain] Running edge agent (E0) on 4 dependencies
+[explain] Running synthesizer agent (S0)
+[explain] Explanation written to results/.../prompt.txt
+[explain] Starting OpenHands refactoring
+[openhands] Created branch: refactor/quickstart_exp/multi_agent_baseline/scc_0_cycle_3
+[openhands] Iteration 1/100: Analyzing cycle...
+[openhands] Iteration 15/100: Applying refactoring...
+[openhands] Iteration 23/100: Running tests...
+[openhands] Success: Changes committed to local branch
+[explain] Patch written to results/.../refactor.patch
+```
 
-### Step 3: Go live
+<Info>
+**Runtime**: Expect 5-15 minutes per cycle depending on LLM speed and OpenHands iteration count. The `--modes` flag runs multiple configurations sequentially.
+</Info>
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+### Output files
+
+Results are stored in `results/<experiment_id>/<repo>/<branch>/<mode>/<cycle_id>/`:
+
+- **Explanation artifacts**:
+  - `prompt.txt` - Final prompt sent to OpenHands
+  - `transcript.json` - All LLM agent interactions
+  - `usage.json` - Token usage statistics
+  
+- **Refactoring artifacts**:
+  - `openhands_log.txt` - OpenHands execution log
+  - `trajectory.json` - Action-by-action trace
+  - `refactor.patch` - Git diff of all changes
+  - `status.json` - Success/failure status
+
+<Tip>
+Read `prompt.txt` to see the explanation the multi-agent system generated. This is what OpenHands uses as context for refactoring.
+</Tip>
+
+## Step 5: Collect metrics
+
+Evaluate refactoring results by recomputing metrics on the modified code:
+
+```bash
+scripts/run_metrics.sh -c configs/pipeline.yaml \
+  --modes multi_agent_baseline \
+  --modes multi_agent_with_boundary
+```
+
+### Metrics collected
+
+<CardGroup cols={2}>
+  <Card title="Architectural metrics" icon="sitemap">
+    - SCC count (did the cycle break?)
+    - Graph structure changes
+    - Module coupling metrics
+  </Card>
+  
+  <Card title="Code quality metrics" icon="code">
+    - Cyclomatic complexity (Radon)
+    - Maintainability index (Radon)
+    - Security issues (Bandit)
+    - Dead code (Vulture)
+    - Code smells (PyExamine)
+  </Card>
+  
+  <Card title="Test results" icon="flask">
+    - Test pass/fail status
+    - Test coverage (if available)
+  </Card>
+  
+  <Card title="Diff metrics" icon="file-code">
+    - Lines changed
+    - Files modified
+    - Complexity delta
+  </Card>
+</CardGroup>
+
+### Output files
+
+Metrics are stored in `results/<experiment_id>/<repo>/<branch>/<mode>/<cycle_id>/metrics/`:
+
+- `architecture_metrics.json` - Post-refactoring SCC analysis
+- `quality_metrics.json` - Code quality measurements
+- `test_results.json` - Test execution results
+- `comparison.json` - Before/after metric comparison
+
+## Step 6: Analyze results
+
+Compare baseline vs. refactored metrics:
+
+```bash
+# Check if cycles were broken
+cat results/quickstart_exp/MudBlazor/dev/multi_agent_baseline/scc_0_cycle_3/metrics/comparison.json
+```
+
+Example output:
+
+```json
+{
+  "cycle_broken": true,
+  "scc_count_before": 5,
+  "scc_count_after": 4,
+  "complexity_before": 127,
+  "complexity_after": 119,
+  "tests_passing": true,
+  "lines_changed": 45
+}
+```
+
+<Tip>
+**Success indicators**:
+- `cycle_broken: true` - The dependency cycle was eliminated
+- `tests_passing: true` - Tests still pass after refactoring
+- Complexity decreased or stayed similar
+- Minimal lines changed
+</Tip>
+
+## Understanding the results
+
+### Successful refactoring
+
+✅ Cycle eliminated (SCC no longer exists)  
+✅ Tests pass  
+✅ Code quality maintained or improved  
+✅ Reasonable number of changes (under 100 lines)
+
+### Partial success
+
+⚠️ Cycle reduced but not eliminated  
+⚠️ Tests pass but code quality degraded  
+⚠️ Large number of changes (over 200 lines)
+
+### Failed refactoring
+
+❌ Cycle still exists unchanged  
+❌ Tests fail  
+❌ OpenHands timed out or errored  
+❌ Extensive unwanted changes
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Configuration guide" icon="gear" href="/guide/configuration">
+    Learn about all configuration options and multi-agent variants
+  </Card>
+  
+  <Card title="Multi-agent architecture" icon="users" href="/concepts/agents">
+    Deep dive into edge agents, synthesizers, and auxiliary agents
+  </Card>
+  
+  <Card title="Results structure" icon="folder" href="/advanced/results-structure">
+    Understand output files and how to analyze experiment data
+  </Card>
+  
+  <Card title="Troubleshooting" icon="wrench" href="/advanced/troubleshooting">
+    Common issues and solutions
+  </Card>
 </CardGroup>
 
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>
+## Tips for running experiments
+
+<Tip>
+**Start small**: Begin with 5-10 cycles, 2-5 nodes each. Experiment with different `--modes` to compare multi-agent configurations.
+</Tip>
+
+<Tip>
+**Monitor LLM usage**: Check `usage.json` files to track token consumption. Large context windows (128k+) are recommended.
+</Tip>
+
+<Tip>
+**Resume capability**: If an experiment is interrupted, re-run the same command. The framework detects incomplete work and resumes automatically.
+</Tip>
+
+<Warning>
+**Never push refactored branches**: All changes are committed to **local branches only**. The framework never pushes to remote. This is by design for safe large-scale experimentation.
+</Warning>

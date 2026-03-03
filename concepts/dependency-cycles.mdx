@@ -1,0 +1,497 @@
+---
+title: Dependency cycles and SCCs
+description: How the framework identifies and represents strongly connected components and architectural dependency cycles
+---
+
+The ATD framework focuses on **strongly connected components (SCCs)** in dependency graphs as indicators of architectural technical debt. This page explains the graph theory foundations and implementation.
+
+## Graph representation
+
+### Dependency graph structure
+
+The framework builds a **directed graph** where:
+
+- **Nodes:** Source files (e.g., `src/domain/user.py`)
+- **Edges:** Dependency relationships (e.g., imports, using statements)
+- **Direction:** Edge A → B means "A depends on B" or "A imports B"
+
+From `ATD_identification/extract_sccs.py:74-84`:
+
+```python
+# Build full graph
+G = nx.DiGraph()
+for n in nodes:
+    nid = str(n["id"])
+    G.add_node(nid, abs_path=str(n.get("abs_path", "")))
+
+for e in edges:
+    s = str(e["source"])
+    t = str(e["target"])
+    if s != t:
+        G.add_edge(s, t, relation=str(e.get("relation", relation)))
+```
+
+### Canonical format
+
+Dependency graphs are stored in `dependency_graph.json` with schema:
+
+```json
+{
+  "schema_version": 1,
+  "language": "python",
+  "repo_root": "/path/to/repo",
+  "entry": "src/",
+  "nodes": [
+    {
+      "id": "src/domain/user.py",
+      "abs_path": "/path/to/repo/src/domain/user.py",
+      "kind": "file"
+    }
+  ],
+  "edges": [
+    {
+      "source": "src/domain/user.py",
+      "target": "src/persistence/user_repository.py",
+      "relation": "import"
+    }
+  ]
+}
+```
+
+<Info>
+  Node IDs are **repository-relative paths** to ensure reproducibility across machines.
+</Info>
+
+## Strongly connected components
+
+### Definition
+
+A **strongly connected component (SCC)** is a maximal set of nodes where:
+
+1. Every node can reach every other node through directed edges
+2. Adding any other node would break property 1
+
+<Note>
+  SCCs with size ≥ 2 contain at least one dependency cycle. Singleton SCCs (size 1) are acyclic and ignored.
+</Note>
+
+### Extraction algorithm
+
+From `ATD_identification/extract_sccs.py:101-148`:
+
+```python
+# SCCs (cyclic only)
+scc_sets = [set(s) for s in nx.strongly_connected_components(G) if len(s) > 1]
+scc_sets.sort(key=lambda s: (len(s), sorted(s)), reverse=True)
+
+report_sccs: List[Dict[str, Any]] = []
+totals_nodes = 0
+totals_edges = 0
+totals_loc = 0
+cycle_pressure_lb = 0
+
+for idx, scc in enumerate(scc_sets):
+    sub = G.subgraph(scc).copy()
+    n = sub.number_of_nodes()
+    m = sub.number_of_edges()
+    
+    dens = m / (n * (n - 1)) if n > 1 else 0.0
+    surplus = edge_surplus_lb_undirected(sub)
+    
+    # Calculate lines of code
+    loc = 0
+    for u in sub.nodes():
+        apath = sub.nodes[u].get("abs_path") or abs_by_id.get(u, "")
+        if apath not in loc_cache:
+            loc_cache[apath] = count_loc(apath)
+        loc += loc_cache[apath]
+    
+    report_sccs.append({
+        "id": f"scc_{idx}",
+        "size": n,
+        "edge_count": m,
+        "density_directed": round(dens, 6),
+        "edge_surplus_lb": surplus,
+        "total_loc": loc,
+        "avg_loc_per_node": round(loc / n, 2) if n else 0.0,
+        "nodes": [...],
+        "edges": [...],
+    })
+```
+
+<Tip>
+  The framework uses NetworkX's `strongly_connected_components()` algorithm, which implements Tarjan's algorithm with O(V + E) complexity.
+</Tip>
+
+### SCC metrics
+
+Each SCC is characterized by:
+
+| Metric | Formula | Interpretation |
+|--------|---------|----------------|
+| Size | n = \|nodes\| | Number of files involved |
+| Edge count | m = \|edges\| | Total dependencies |
+| Density | m / (n × (n-1)) | Proportion of possible edges present |
+| Edge surplus | See below | Lower bound on edges to remove |
+| Total LOC | Σ lines | Code volume affected |
+
+### Edge surplus (cycle pressure)
+
+From `ATD_identification/extract_sccs.py:31-40`:
+
+```python
+def edge_surplus_lb_undirected(Gscc: nx.DiGraph) -> int:
+    """
+    Lower bound on number of edges to remove to break cycles (undirected):
+      m_und - (n-1)
+    """
+    n = Gscc.number_of_nodes()
+    if n <= 1:
+        return 0
+    m_und = Gscc.to_undirected(as_view=True).number_of_edges()
+    return max(0, m_und - (n - 1))
+```
+
+<Accordion title="Why undirected edge surplus?">
+  **Theoretical bound:** A tree with n nodes has exactly n-1 edges and is acyclic. Any additional edges create cycles.
+  
+  The undirected surplus `m_und - (n-1)` provides a **lower bound** on the number of edges that must be removed to eliminate all cycles. The actual number may be higher for directed graphs.
+</Accordion>
+
+## PageRank centrality
+
+The framework computes **global PageRank** on the full dependency graph to identify high-impact files.
+
+### Computation
+
+From `ATD_identification/extract_sccs.py:86-99`:
+
+```python
+# Global PageRank (full graph)
+node_pagerank: Dict[str, float] = {}
+if G.number_of_nodes() > 0 and G.number_of_edges() > 0:
+    try:
+        node_pagerank = nx.pagerank(
+            G,
+            alpha=float(args.pagerank_alpha),  # default: 0.85
+            max_iter=int(args.pagerank_max_iter),  # default: 100
+            tol=float(args.pagerank_tol),  # default: 1e-6
+        )
+    except Exception:
+        node_pagerank = {}
+```
+
+<Info>
+  PageRank is computed on the **full graph**, not individual SCCs, to capture global importance across the entire codebase.
+</Info>
+
+### Node features
+
+PageRank scores are stored in `scc_report.json`:
+
+```json
+{
+  "node_features": {
+    "src/domain/user.py": {
+      "pagerank": 0.002341
+    },
+    "src/persistence/user_repository.py": {
+      "pagerank": 0.001987
+    }
+  }
+}
+```
+
+These scores are used during cycle sampling to prioritize cycles containing high-PageRank nodes.
+
+## Cycle identification
+
+### Cycle representation
+
+A **cycle** is represented as an ordered list of nodes where:
+
+1. Each consecutive pair forms an edge: `(nodes[i], nodes[i+1])`
+2. The last node connects back to the first: `(nodes[-1], nodes[0])`
+3. The cycle is **directed** (reversing the order produces a different cycle)
+
+### Canonicalization
+
+From `ATD_identification/pick_cycles.py:22-34`:
+
+```python
+def canonicalize_cycle(nodes: List[str]) -> Tuple[str, ...]:
+    """
+    Canonicalize a directed cycle by rotation ONLY (direction preserved).
+    
+    For directed cycles, reversing a node order generally changes edge directions
+    and can fabricate a cycle that doesn't exist in the graph. So we only rotate
+    to the lexicographically smallest starting node.
+    """
+    if not nodes:
+        return ()
+    cyc = list(nodes)
+    i = min(range(len(cyc)), key=lambda j: cyc[j])
+    return tuple(cyc[i:] + cyc[:i])
+```
+
+<Note>
+  **Directed canonicalization:** Only rotation is performed, not reversal. This ensures the canonical form represents an actual cycle in the directed graph.
+</Note>
+
+### Cycle sampling algorithm
+
+From `ATD_identification/pick_cycles.py:117-172`:
+
+```python
+def _sample_cycles_in_scc(
+    Gscc: nx.DiGraph,
+    *,
+    max_len: int,
+    attempts: int,
+    rng: random.Random,
+) -> List[List[str]]:
+    """
+    Find cycles by repeated bounded random walks:
+      - pick start node
+      - walk up to max_len, stop if we return to a node already on the path
+      - if that closes a cycle back to the repeated node -> record that cycle
+    This is not complete enumeration; it's a fast sampler.
+    """
+    nodes = list(Gscc.nodes())
+    seen: Set[Tuple[str, ...]] = set()
+    found: List[List[str]] = []
+    
+    # Precompute successors for speed
+    succ = {u: list(Gscc.successors(u)) for u in nodes}
+    
+    for _ in range(attempts):
+        start = rng.choice(nodes)
+        path = [start]
+        pos = {start: 0}
+        cur = start
+        
+        for _step in range(max_len):
+            nxts = succ.get(cur) or []
+            if not nxts:
+                break
+            cur = rng.choice(nxts)
+            
+            if cur in pos:
+                # cycle detected
+                i = pos[cur]
+                cyc = path[i:] + [cur]
+                if cyc[0] == cyc[-1]:
+                    cyc_nodes = cyc[:-1]
+                    if 2 <= len(cyc_nodes) <= max_len:
+                        key = canonicalize_cycle(cyc_nodes)
+                        if key and key not in seen:
+                            seen.add(key)
+                            found.append(list(key))
+                break
+            
+            path.append(cur)
+            pos[cur] = len(path) - 1
+    
+    # Prefer longer cycles first
+    found.sort(key=lambda ns: (len(ns), tuple(ns)), reverse=True)
+    return found
+```
+
+<Steps>
+  <Step title="Random walk initialization">
+    Pick a random starting node from the SCC
+  </Step>
+  <Step title="Walk until cycle detected">
+    Follow random outgoing edges. If a node repeats, extract the cycle.
+  </Step>
+  <Step title="Canonicalize and deduplicate">
+    Store canonical form to avoid counting the same cycle multiple times
+  </Step>
+  <Step title="Repeat for N attempts">
+    Configurable attempts per SCC (default: 5000)
+  </Step>
+</Steps>
+
+<Info>
+  This is a **sampling** approach, not exhaustive enumeration. It scales to large SCCs where full cycle enumeration is intractable.
+</Info>
+
+## Edge-disjoint constraint
+
+### Motivation
+
+When selecting multiple cycles from an SCC for refactoring, **edge-disjoint cycles** ensure:
+
+1. No overlapping refactoring efforts (each dependency edge is addressed once)
+2. Independent refactoring branches (parallel experimentation)
+3. Cleaner signal for measuring refactoring impact
+
+### Packing algorithm
+
+From `ATD_identification/pick_cycles.py:178-217`:
+
+```python
+def _pack_edge_disjoint_cycles(
+    cycles: List[List[str]],
+    pr: Dict[str, float],
+    *,
+    max_keep: int,
+) -> List[List[str]]:
+    """
+    Greedy packing to enforce pairwise edge-disjointness among returned cycles.
+    
+    - Sort candidates by (length desc, avg_pagerank desc, lexical tie-break)
+    - Accept a cycle iff none of its directed edges have been used
+    - Stop once we have max_keep (if max_keep > 0)
+    """
+    used_edges: Set[Tuple[str, str]] = set()
+    kept: List[List[str]] = []
+    
+    def avg_pr(cyc: List[str]) -> float:
+        return float(sum(pr.get(n, 0.0) for n in cyc) / max(1, len(cyc)))
+    
+    # Best-first ordering
+    ordered = sorted(
+        cycles,
+        key=lambda cyc: (len(cyc), avg_pr(cyc), tuple(cyc)),
+        reverse=True,
+    )
+    
+    for cyc in ordered:
+        edges = cycle_edge_tuples(cyc)
+        if any(e in used_edges for e in edges):
+            continue
+        kept.append(cyc)
+        used_edges.update(edges)
+        if max_keep > 0 and len(kept) >= max_keep:
+            break
+    
+    return kept
+```
+
+<Steps>
+  <Step title="Sort by priority">
+    Prefer longer cycles with higher average PageRank
+  </Step>
+  <Step title="Greedy selection">
+    Accept cycles if none of their edges are already used
+  </Step>
+  <Step title="Track used edges">
+    Maintain set of directed edge tuples (source, target)
+  </Step>
+  <Step title="Stop at max_keep">
+    Configurable limit per SCC (default: 200)
+  </Step>
+</Steps>
+
+<Note>
+  **Scope:** Edge-disjointness is enforced **within each SCC**, not globally across all SCCs. Different SCCs can have overlapping cycles.
+</Note>
+
+## Cycle catalog schema
+
+The `cycle_catalog.json` file contains:
+
+```json
+{
+  "schema_version": 1,
+  "generated_at_utc": "2024-03-15T10:30:45Z",
+  "params": {
+    "max_cycle_len": 8,
+    "attempts_per_scc": 5000,
+    "max_cycles_per_scc": 200,
+    "seed": 12345,
+    "edge_disjoint": true,
+    "edge_disjoint_scope": "within_scc",
+    "directed_canonicalization": "rotation_only",
+    "pagerank_source": "scc_report.node_features.pagerank",
+    "pagerank_scope": "global"
+  },
+  "summary": {
+    "scc_count": 15,
+    "cycle_count": 142
+  },
+  "sccs": [
+    {
+      "id": "scc_0",
+      "node_count": 25,
+      "edge_count": 48,
+      "cycles": [
+        {
+          "id": "scc_0_cycle_0",
+          "length": 4,
+          "nodes": [
+            "src/domain/user.py",
+            "src/persistence/user_repository.py",
+            "src/domain/order.py",
+            "src/persistence/order_repository.py"
+          ],
+          "edges": [
+            {"source": "src/domain/user.py", "target": "src/persistence/user_repository.py", "relation": "import"},
+            {"source": "src/persistence/user_repository.py", "target": "src/domain/order.py", "relation": "import"},
+            {"source": "src/domain/order.py", "target": "src/persistence/order_repository.py", "relation": "import"},
+            {"source": "src/persistence/order_repository.py", "target": "src/domain/user.py", "relation": "import"}
+          ],
+          "metrics": {
+            "pagerank_avg": 0.002164,
+            "pagerank_min": 0.001987,
+            "pagerank_max": 0.002341
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+## Configurable parameters
+
+From `ATD_identification/pick_cycles.py:224-239`, cycle selection is controlled by:
+
+```bash
+python3 pick_cycles.py \
+  --dependency-graph dependency_graph.json \
+  --scc-report scc_report.json \
+  --out cycle_catalog.json \
+  --max-cycle-len 8 \
+  --attempts-per-scc 5000 \
+  --max-cycles-per-scc 200 \
+  --seed 12345
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `max-cycle-len` | 8 | Maximum cycle length (longer cycles are ignored) |
+| `attempts-per-scc` | 5000 | Number of random walks per SCC |
+| `max-cycles-per-scc` | 200 | Maximum cycles to keep per SCC after packing |
+| `seed` | 12345 | Random seed for reproducibility |
+
+<Tip>
+  Increase `attempts-per-scc` for larger SCCs to discover more cycles. Decrease for faster execution.
+</Tip>
+
+## Relationship to ATD
+
+### Dependency cycles as ATD indicators
+
+The framework treats dependency cycles as **architectural technical debt** because:
+
+1. **Violation of design principles:** Cycles violate layered architecture and dependency inversion
+2. **Maintenance burden:** Changes in one file ripple through the entire cycle
+3. **Testing difficulty:** Circular dependencies complicate unit testing and mocking
+4. **Build complexity:** May require special handling in build systems
+
+### From cycles to refactoring
+
+The pipeline uses cycle structure to guide refactoring:
+
+1. **Explain phase:** Multi-agent system analyzes why the cycle exists
+2. **Refactoring phase:** LLM agent breaks the cycle by:
+   - Extracting shared abstractions
+   - Introducing dependency inversion
+   - Restructuring layers
+3. **Metrics phase:** Validate cycle removal and measure impact
+
+<Info>
+  Not all cycles are equally problematic. The framework uses PageRank to prioritize high-impact cycles for refactoring.
+</Info>

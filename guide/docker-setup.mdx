@@ -1,0 +1,270 @@
+---
+title: Docker setup
+description: Build and run the ATD pipeline Docker container
+---
+
+The ATD pipeline runs entirely inside a Docker container with all dependencies pre-installed. This ensures reproducibility and isolates experiments from your host system.
+
+## Prerequisites
+
+Before building the container, ensure you have:
+
+- Docker Engine (tested on Linux/WSL2)
+- Docker socket access (`/var/run/docker.sock`)
+- Sufficient disk space for Docker images (~5-10 GB)
+- Git (for cloning subject repositories)
+
+<Warning>
+The pipeline was developed on Windows/WSL2 with Docker Desktop. Compatibility with other platforms (macOS, native Linux) has not been extensively tested.
+</Warning>
+
+## Understanding the Dockerfile
+
+The `Dockerfile` (defined in `Dockerfile:1-103`) creates a development environment with:
+
+- Python 3.12 via `uv` package manager
+- Docker CLI for nested container support (OpenHands requirement)
+- .NET SDKs (6.0, 8.0, 9.0, 10.0) for C# project analysis
+- Mono runtime for .NET Framework compatibility
+- Java 17 JRE for running the Depends tool
+- Depends 0.9.7 for dependency graph extraction
+- PyExamine for code quality metrics
+- All Python dependencies from `pyproject.toml` and `uv.lock`
+
+<Info>
+The pipeline uses the `uv` package manager for fast, reproducible Python dependency management.
+</Info>
+
+## Building the Docker image
+
+<Steps>
+
+### Build the development image
+
+From the repository root, build the Docker image:
+
+```bash
+docker build --target dev -t atd-dev .
+```
+
+This command:
+- Uses the `dev` build target from the multi-stage Dockerfile
+- Tags the image as `atd-dev`
+- Installs all dependencies defined in `uv.lock`
+- Downloads and configures the Depends tool
+- Installs PyExamine from the pinned Git reference
+
+<Note>
+Build time is typically 5-10 minutes on the first run. Subsequent builds use Docker layer caching for faster rebuilds.
+</Note>
+
+### Verify the build
+
+Check that the image was created successfully:
+
+```bash
+docker images | grep atd-dev
+```
+
+You should see output similar to:
+
+```
+atd-dev    latest    abc123def456    2 minutes ago    2.5GB
+```
+
+</Steps>
+
+## Running the container
+
+<Steps>
+
+### Prepare environment variables
+
+The container requires access to the Docker socket for launching nested OpenHands containers. Set the Docker group ID:
+
+```bash
+DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)
+```
+
+<Info>
+This ensures the container user can access the Docker socket without root privileges.
+</Info>
+
+### Launch the interactive container
+
+Start the container with proper volume mounts and network configuration:
+
+```bash
+docker run --rm -it \
+  --add-host=host.docker.internal:host-gateway \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v "$(pwd)":/workspace \
+  -w /workspace \
+  --name atd-dev \
+  --user "$(id -u):$(id -g)" \
+  --group-add "$DOCKER_GID" \
+  -e HOST_PWD="$(pwd)" \
+  atd-dev
+```
+
+**Flag explanations:**
+
+| Flag | Purpose |
+|------|----------|
+| `--rm` | Automatically remove the container when it exits |
+| `-it` | Interactive terminal mode |
+| `--add-host=host.docker.internal:host-gateway` | Allows container to reach services on the host (e.g., LLM endpoint) |
+| `-v /var/run/docker.sock:/var/run/docker.sock` | Mounts Docker socket for nested container support |
+| `-v "$(pwd)":/workspace` | Mounts current directory into container at `/workspace` |
+| `-w /workspace` | Sets working directory to `/workspace` |
+| `--name atd-dev` | Names the container for easy reference |
+| `--user "$(id -u):$(id -g)"` | Runs as your host user ID for correct file ownership |
+| `--group-add "$DOCKER_GID"` | Adds Docker group for socket access |
+| `-e HOST_PWD="$(pwd)"` | Environment variable used by OpenHands |
+
+<Warning>
+The `-v "$(pwd)":/workspace` mount assumes you're running from the repository root. All file paths in the configuration are relative to this location.
+</Warning>
+
+### Verify container environment
+
+Once inside the container, verify the environment:
+
+```bash
+# Check Python version and packages
+python3 --version
+pip list | grep openhands
+
+# Check Depends tool
+depends-cli --version
+
+# Check Docker access
+docker ps
+
+# Check .NET SDKs
+dotnet --list-sdks
+```
+
+All commands should execute without errors.
+
+</Steps>
+
+## File ownership and permissions
+
+The container runs as your host user (via `--user` flag) to ensure files created inside the container have correct ownership on the host filesystem.
+
+<Info>
+All experiment results, logs, and Git branches will be owned by your host user, not root.
+</Info>
+
+## Docker Compose alternative
+
+The repository includes a `compose.yml` file for running OpenHands standalone (not used by the pipeline):
+
+```yaml
+services:
+  openhands:
+    image: docker.all-hands.dev/all-hands-ai/openhands:0.57
+    container_name: openhands-app
+    ports: ["3000:3000"]
+    environment:
+      LLM_MODEL: "${LLM_MODEL}"
+      LLM_BASE_URL: "${LLM_BASE_URL}"
+      LLM_API_KEY: "${LLM_API_KEY}"
+      LOG_ALL_EVENTS: "true"
+      SANDBOX_RUNTIME_CONTAINER_IMAGE: "docker.all-hands.dev/all-hands-ai/runtime:0.57-nikolaik"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${USERPROFILE:-~}/.openhands:/.openhands
+      - ./oh-work:/workspace
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+```
+
+<Note>
+This Compose file is **not** used by the automated pipeline. The pipeline invokes OpenHands programmatically via Python, not via Docker Compose.
+</Note>
+
+## Nested container architecture
+
+The ATD pipeline uses a nested container architecture:
+
+1. **Outer container** (`atd-dev`): Runs the Python pipeline, dependency extraction, and metrics collection
+2. **Inner containers** (OpenHands runtime): Launched by OpenHands for isolated refactoring environments
+
+This architecture ensures:
+- Each refactoring attempt runs in a clean environment
+- OpenHands can safely modify files without affecting the pipeline
+- Complete isolation between different cycles and modes
+
+<Info>
+The Docker socket mount (`-v /var/run/docker.sock`) enables the outer container to launch inner containers.
+</Info>
+
+## Troubleshooting
+
+### Permission denied: /var/run/docker.sock
+
+**Cause**: Your user is not in the Docker group.
+
+**Solution**:
+```bash
+sudo usermod -aG docker $USER
+# Log out and back in for changes to take effect
+```
+
+### Cannot connect to Docker daemon
+
+**Cause**: Docker daemon is not running.
+
+**Solution**:
+```bash
+sudo systemctl start docker  # Linux
+# or start Docker Desktop on Windows/macOS
+```
+
+### OpenHands cannot reach host.docker.internal
+
+**Cause**: The `--add-host` flag is missing or incorrect.
+
+**Solution**: Ensure you include `--add-host=host.docker.internal:host-gateway` when running the container.
+
+### File ownership issues
+
+**Cause**: Container is running as root instead of your host user.
+
+**Solution**: Always include `--user "$(id -u):$(id -g)"` when launching the container.
+
+## Updating dependencies
+
+To update Python dependencies:
+
+<Steps>
+
+### Update uv.lock
+
+On your host machine (not inside the container):
+
+```bash
+uv lock --upgrade
+```
+
+### Rebuild the Docker image
+
+```bash
+docker build --target dev -t atd-dev .
+```
+
+</Steps>
+
+<Warning>
+Changing dependency versions may affect reproducibility. Pin specific versions in `pyproject.toml` for production experiments.
+</Warning>
+
+## Best practices
+
+- Always run the container from the repository root directory
+- Use named volumes for persistent data if needed
+- Monitor disk usage (`docker system df`) as experiments generate large volumes of data
+- Periodically clean up unused Docker images and containers (`docker system prune`)
+- Keep the `uv.lock` file committed to ensure reproducible builds

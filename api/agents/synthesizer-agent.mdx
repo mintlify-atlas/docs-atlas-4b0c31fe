@@ -1,0 +1,255 @@
+---
+title: Synthesizer agent
+description: Combines edge-level reports into cycle-level explanations
+---
+
+The synthesizer agent receives individual edge reports from the [edge agent](/api/agents/edge-agent) and produces a unified explanation of how and why a dependency cycle exists.
+
+## Overview
+
+The synthesizer agent:
+
+- Aggregates edge-level dependency explanations
+- Explains how individual edges combine to form a cycle
+- Interprets why the coupling exists (cautiously)
+- Provides maintainability impact notes
+- Optionally suggests edges to break (depending on variant)
+- Incorporates auxiliary context (boundary/graph insights)
+
+Output is later refined by the [review agent](/api/agents/review-agent).
+
+## Function signature
+
+```python
+def run_synthesizer_agent(
+    *,
+    client: LLMClient,
+    transcript_path: str,
+    language: str,
+    cycle_nodes: List[str],
+    edge_reports: Sequence[str],
+    aux_context: str = "",
+    synthesizer_variant_id: str = "S0",
+) -> str
+```
+
+Location: `explain_AS/agents/synthesizer.py:97`
+
+## Parameters
+
+<ParamField path="client" type="LLMClient" required>
+  The LLM client instance for making API calls
+</ParamField>
+
+<ParamField path="transcript_path" type="str" required>
+  Path to the transcript file where conversation history is logged
+</ParamField>
+
+<ParamField path="language" type="str" required>
+  Programming language of the codebase (e.g., "Python", "TypeScript")
+</ParamField>
+
+<ParamField path="cycle_nodes" type="List[str]" required>
+  List of file paths forming the dependency cycle
+</ParamField>
+
+<ParamField path="edge_reports" type="Sequence[str]" required>
+  List of edge reports in cycle order (output from edge agent)
+</ParamField>
+
+<ParamField path="aux_context" type="str" default="">
+  Optional additional context from boundary/graph agents
+</ParamField>
+
+<ParamField path="synthesizer_variant_id" type="str" default="S0">
+  Variant ID controlling the synthesis style. Options:
+  - `"S0"`: Cycle explanation only (default)
+  - `"S1"`: Include concrete plan to break cycle (1-2 edges)
+  - `"S2"`: Compare multiple options with trade-offs (2-3 edges)
+</ParamField>
+
+## Return value
+
+<ResponseField name="explanation" type="str">
+  A structured cycle-level explanation with sections varying by variant:
+  
+  **Variant S0 (default):**
+  - Cycle summary
+  - How the cycle is formed
+  - Why this coupling exists (cautious interpretation)
+  - Impact / maintainability notes
+  - Reminders / constraints
+  
+  **Variant S1:**
+  - Cycle summary
+  - How the cycle is formed
+  - Candidate edge(s) to break (pick 1-2)
+  - Justification (grounded, cautious)
+  - Minimal refactoring strategy
+  - Risks / checks
+  - Reminders / constraints
+  
+  **Variant S2:**
+  - Cycle summary
+  - How the cycle is formed
+  - Candidate edges to break (ranked 1-3)
+  - Trade-offs (risk, effort, scope)
+  - Recommended choice and why
+  - Suggested refactoring approach (brief)
+  - Reminders / constraints
+</ResponseField>
+
+## Variants
+
+The synthesizer agent supports three prompt variants defined in `explain_AS/agents/prompts/prompts_synthesizer.py`:
+
+### S0 - Explanation only (default)
+
+```python
+preamble="""You are the Synthesizer Agent.
+You receive edge-level explanations for each edge in a dependency cycle.
+
+Rules:
+- Stay consistent with the edge reports. Do not invent details.
+- No tables, no JSON.
+- Avoid overconfidence. If edge reports are unclear, say so.
+- Emphasize that the refactoring agent must inspect the actual code.
+- If you see truncation notes, assume some context may be missing.
+
+Your job:
+- Produce a cycle-level explanation that helps an automated refactoring agent 
+  understand the cycle. Do not propose specific edges to break.
+"""
+```
+
+Produces explanations without suggesting which edges to break.
+
+### S1 - Concrete plan
+
+Includes a minimal plan for breaking the cycle with 1-2 candidate edges. Emphasizes actually improving architecture, not hacky solutions.
+
+### S2 - Trade-off comparison
+
+Provides a ranked shortlist of 2-3 options with pros/cons analysis and a recommended choice.
+
+<Note>
+Variants S1 and S2 include explicit rules:
+- The cycle must be truly broken, not just moved or made larger
+- Do not suggest hacky solutions to break cycles
+- Suggestions are framed as recommendations, not commands
+</Note>
+
+## Token budget constants
+
+<ParamField path="SYNTHESIZER_MIN_OUTPUT_TOKENS_RESERVED" type="int" default="3334">
+  Token reservation for agent output (approximately 10,000 characters)
+</ParamField>
+
+<ParamField path="SYNTHESIZER_SAFETY_MARGIN_TOKENS" type="int" default="1000">
+  Safety margin to prevent context overflow
+</ParamField>
+
+## Prompt building
+
+The `build_synthesizer_user_prompt` function constructs the agent prompt:
+
+```python
+def build_synthesizer_user_prompt(
+    *,
+    client: LLMClient,
+    language: str,
+    cycle_nodes: List[str],
+    edge_reports: Sequence[str],
+    aux_context: str,
+    synthesizer_variant_id: str,
+) -> str
+```
+
+Location: `explain_AS/agents/synthesizer.py:20`
+
+### Token allocation logic
+
+1. Calculate total input budget after reserving output tokens and safety margin
+2. Normalize edge reports (replace empty with "N/A")
+3. Combine edge reports and aux context into budget items
+4. Use `allocate_token_budgets_even_share_with_redistribution` to fairly allocate tokens
+5. Format each edge report block with its allocated budget
+6. Format aux context block with its allocated budget
+7. Assemble final prompt with all sections
+
+<Note>
+The synthesizer uses even-share redistribution: if some edge reports are short, their unused budget is redistributed to longer reports and auxiliary context.
+</Note>
+
+## Example usage
+
+<CodeGroup>
+```python Basic usage (S0)
+from agents.synthesizer import run_synthesizer_agent
+
+explanation = run_synthesizer_agent(
+    client=llm_client,
+    transcript_path="/tmp/transcript.jsonl",
+    language="Python",
+    cycle_nodes=["src/foo.py", "src/bar.py", "src/baz.py"],
+    edge_reports=[
+        "Edge: foo.py -> bar.py\nWhere in A: Line 12...\n",
+        "Edge: bar.py -> baz.py\nWhere in A: Line 45...\n",
+        "Edge: baz.py -> foo.py\nWhere in A: Line 8...\n",
+    ],
+)
+```
+
+```python With auxiliary context
+explanation = run_synthesizer_agent(
+    client=llm_client,
+    transcript_path="/tmp/transcript.jsonl",
+    language="TypeScript",
+    cycle_nodes=cycle_files,
+    edge_reports=edge_reports_list,
+    aux_context=boundary_report + "\n\n" + graph_report,
+)
+```
+
+```python Variant S1 - With refactoring plan
+explanation = run_synthesizer_agent(
+    client=llm_client,
+    transcript_path="/tmp/transcript.jsonl",
+    language="Python",
+    cycle_nodes=cycle_files,
+    edge_reports=edge_reports_list,
+    aux_context=aux_context_text,
+    synthesizer_variant_id="S1",  # Include minimal plan
+)
+```
+
+```python Variant S2 - Compare options
+explanation = run_synthesizer_agent(
+    client=llm_client,
+    transcript_path="/tmp/transcript.jsonl",
+    language="Python",
+    cycle_nodes=cycle_files,
+    edge_reports=edge_reports_list,
+    aux_context=aux_context_text,
+    synthesizer_variant_id="S2",  # Ranked options with trade-offs
+)
+```
+</CodeGroup>
+
+## Prompt structure
+
+The synthesizer prompt includes:
+
+1. **Preamble**: Base rules + variant-specific job description
+2. **Edge semantics**: Language-specific dependency semantics
+3. **Cycle chain**: Pretty-printed list of files in cycle order
+4. **Edge reports**: Numbered reports with token budgeting and truncation
+5. **Auxiliary context**: Optional boundary/graph insights
+6. **Output headings**: Variant-specific section requirements
+
+## Related agents
+
+- [Edge agent](/api/agents/edge-agent) - Produces the edge reports consumed by this agent
+- [Review agent](/api/agents/review-agent) - Refines synthesizer output for clarity
+- [Boundary agent](/api/agents/boundary-agent) - Provides architectural boundary insights
+- [Graph agent](/api/agents/graph-agent) - Provides SCC structural context

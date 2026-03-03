@@ -1,0 +1,227 @@
+---
+title: Edge agent
+description: Analyzes individual dependency edges between files in a cycle
+---
+
+The edge agent examines a single directed dependency edge A → B within a dependency cycle. It analyzes the specific code locations where dependencies occur and explains how file A uses functionality from file B.
+
+## Overview
+
+The edge agent is responsible for:
+
+- Identifying the precise locations in file A that depend on file B
+- Extracting what symbols/functionality from B are being used
+- Explaining how A uses those dependencies
+- Detecting uncertainty or incomplete information due to truncation
+
+Edge reports are later consumed by the [synthesizer agent](/api/agents/synthesizer-agent) to produce cycle-level explanations.
+
+## Function signature
+
+```python
+def run_edge_agent(
+    *,
+    client: LLMClient,
+    transcript_path: str,
+    language: str,
+    cycle_nodes: List[str],
+    edge: Edge,
+    files_by_node: Dict[str, str],
+    edge_variant_id: str = "E0",
+) -> str
+```
+
+Location: `explain_AS/agents/edge.py:124`
+
+## Parameters
+
+<ParamField path="client" type="LLMClient" required>
+  The LLM client instance for making API calls
+</ParamField>
+
+<ParamField path="transcript_path" type="str" required>
+  Path to the transcript file where conversation history is logged
+</ParamField>
+
+<ParamField path="language" type="str" required>
+  Programming language of the codebase (e.g., "Python", "TypeScript")
+</ParamField>
+
+<ParamField path="cycle_nodes" type="List[str]" required>
+  List of file paths forming the dependency cycle
+</ParamField>
+
+<ParamField path="edge" type="Edge" required>
+  Edge object containing source file `a` and target file `b` (repo-relative paths)
+</ParamField>
+
+<ParamField path="files_by_node" type="Dict[str, str]" required>
+  Dictionary mapping file paths to their text contents
+</ParamField>
+
+<ParamField path="edge_variant_id" type="str" default="E0">
+  Variant ID controlling the analysis style. Options:
+  - `"E0"`: Basic edge analysis (default)
+  - `"E1"`: Includes cautious intent inference
+  - `"E2"`: Includes 1-2 decoupling suggestions
+</ParamField>
+
+## Return value
+
+<ResponseField name="report" type="str">
+  A structured text report with the following sections (exact headings vary by variant):
+  
+  **Variant E0 (default):**
+  - Edge
+  - Where in A
+  - What from B
+  - How A uses it
+  - Notes / uncertainty
+  
+  **Variant E1:**
+  - Edge
+  - Where in A
+  - What from B
+  - How A uses it
+  - Likely intent (cautious)
+  - Notes / uncertainty
+  
+  **Variant E2:**
+  - Edge
+  - Where in A
+  - What from B
+  - How A uses it
+  - Decoupling ideas (1-2, cautious)
+  - Notes / uncertainty
+</ResponseField>
+
+## Edge data class
+
+```python
+@dataclass(frozen=True)
+class Edge:
+    a: str  # repo-relative file path
+    b: str  # repo-relative file path
+```
+
+Location: `explain_AS/agents/edge.py:28`
+
+## Variants
+
+The edge agent supports three prompt variants defined in `explain_AS/agents/prompts/prompts_edge.py`:
+
+### E0 - Basic analysis (default)
+
+```python
+preamble="""You are an Edge Agent analyzing one dependency edge A -> B inside a dependency cycle.
+
+Rules:
+- Stay grounded in the code and file paths/names.
+- Stay factual. If unsure, say so.
+- No tables, no JSON.
+- Keep it concise, but do not omit important dependency details.
+- If you see truncation notes, assume some context may be missing.
+- In your response, use the real file names instead of calling them A and B.
+
+Additional rules:
+- Do not propose refactorings. Your job is to explain what the dependency is and how it is used.
+"""
+```
+
+### E1 - With intent inference
+
+Includes cautious interpretation of developer intent based on naming and folder structure.
+
+### E2 - With decoupling suggestions
+
+May propose 1-2 plausible decoupling options, clearly marked as suggestions.
+
+## Token budget constants
+
+<ParamField path="EDGE_MIN_OUTPUT_TOKENS_RESERVED" type="int" default="2000">
+  Baseline token reservation for agent output (approximately 6,000 characters)
+</ParamField>
+
+<ParamField path="EDGE_SAFETY_MARGIN_TOKENS" type="int" default="1000">
+  Safety margin to prevent context overflow
+</ParamField>
+
+## Prompt building
+
+The `build_edge_user_prompt` function constructs the agent prompt with intelligent token budgeting:
+
+```python
+def build_edge_user_prompt(
+    *,
+    client: LLMClient,
+    language: str,
+    cycle_nodes: List[str],
+    edge: Edge,
+    files_by_node: Dict[str, str],
+    edge_variant_id: str,
+) -> str
+```
+
+Location: `explain_AS/agents/edge.py:34`
+
+### Token allocation logic
+
+1. Files are hard-capped at 40,000 characters before budgeting
+2. Remaining context budget is calculated after reserving output tokens and safety margin
+3. Budget is allocated between file A and file B using `allocate_two_way_with_redistribution`
+4. If one file needs less than its fair share, excess tokens are redistributed to the other file
+5. Files are truncated to their allocated character budgets with truncation notices
+
+<Note>
+The edge agent automatically handles token budgeting to fit both files within the model's context window. Truncated files include a notice: `[NOTE: HARD-CAPPED to 40,000 chars before prompt budgeting. Some code omitted.]`
+</Note>
+
+## Example usage
+
+<CodeGroup>
+```python Basic usage
+from agents.edge import Edge, run_edge_agent
+
+edge_report = run_edge_agent(
+    client=llm_client,
+    transcript_path="/tmp/transcript.jsonl",
+    language="Python",
+    cycle_nodes=["src/foo.py", "src/bar.py", "src/baz.py"],
+    edge=Edge(a="src/foo.py", b="src/bar.py"),
+    files_by_node={
+        "src/foo.py": "import bar\n\ndef process():\n    bar.helper()\n",
+        "src/bar.py": "def helper():\n    pass\n",
+    },
+)
+```
+
+```python With variant E1
+edge_report = run_edge_agent(
+    client=llm_client,
+    transcript_path="/tmp/transcript.jsonl",
+    language="TypeScript",
+    cycle_nodes=cycle_files,
+    edge=Edge(a="src/service.ts", b="src/model.ts"),
+    files_by_node=files_dict,
+    edge_variant_id="E1",  # Include intent inference
+)
+```
+
+```python With variant E2
+edge_report = run_edge_agent(
+    client=llm_client,
+    transcript_path="/tmp/transcript.jsonl",
+    language="Python",
+    cycle_nodes=cycle_files,
+    edge=Edge(a="handlers.py", b="database.py"),
+    files_by_node=files_dict,
+    edge_variant_id="E2",  # Include decoupling ideas
+)
+```
+</CodeGroup>
+
+## Related agents
+
+- [Synthesizer agent](/api/agents/synthesizer-agent) - Combines edge reports into cycle explanations
+- [Review agent](/api/agents/review-agent) - Finalizes and validates synthesizer output
+- [Boundary agent](/api/agents/boundary-agent) - Infers architectural boundaries from file paths

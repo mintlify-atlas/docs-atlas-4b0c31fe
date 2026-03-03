@@ -1,0 +1,187 @@
+---
+title: System architecture
+description: Overview of the multi-agent LLM framework for analyzing and refactoring architectural technical debt
+---
+
+The ATD pipeline is a research framework designed to automatically detect, explain, and refactor architectural technical debt (ATD) in software systems using a multi-agent LLM approach.
+
+## Pipeline overview
+
+The framework operates as a sequential pipeline with distinct phases, each building on the outputs of the previous stages:
+
+<Steps>
+  <Step title="Baseline collection">
+    Extract dependency graphs and identify strongly connected components (SCCs) containing circular dependencies
+  </Step>
+  <Step title="Cycle selection">
+    Sample representative cycles from SCCs using PageRank-weighted random walks with edge-disjoint constraints
+  </Step>
+  <Step title="Explain phase">
+    Multi-agent system analyzes cycles to generate architectural explanations
+  </Step>
+  <Step title="Refactoring phase">
+    OpenHands agent applies automated refactoring based on cycle explanations
+  </Step>
+  <Step title="Metrics collection">
+    Measure impact of refactoring on code quality and architectural metrics
+  </Step>
+</Steps>
+
+## Core components
+
+### Pipeline orchestration
+
+The pipeline is orchestrated through two main modules:
+
+- **`atd_pipeline/cli.py`** - Command-line interface exposing pipeline phases as subcommands
+- **`atd_pipeline/runner.py`** - Execution engine managing experiment units, resumption, and status tracking
+
+```python
+# From atd_pipeline/cli.py:28-31
+CYCLE_EXPLAINER_SCRIPT = REPO_ROOT_DIR / "explain_AS" / "explain_entry.py"
+OPENHANDS_WRAPPER_SCRIPT = REPO_ROOT_DIR / "run_OpenHands" / "run_OpenHands.sh"
+BASELINE_COLLECT_COMMAND = ["bash", str(REPO_ROOT_DIR / "scripts" / "baseline_collect.sh")]
+BRANCH_METRICS_COMMAND = ["bash", str(REPO_ROOT_DIR / "scripts" / "branch_metrics_collect.sh")]
+```
+
+### Dependency analysis
+
+The `ATD_identification/` module handles graph construction and cycle detection:
+
+- **`extract_sccs.py`** - Extracts strongly connected components using NetworkX
+- **`pick_cycles.py`** - Samples cycles within SCCs using configurable strategies
+- **`build_dependency_graph_pydeps.py`** - Constructs language-specific dependency graphs
+
+<Info>
+  The framework uses **PageRank** computed on the full dependency graph to prioritize high-impact cycles during sampling.
+</Info>
+
+### Multi-agent explanation system
+
+The `explain_AS/` module implements the multi-agent architecture:
+
+- **`engine.py`** - Orchestrates agent execution and manages token budgets
+- **`agents/`** - Individual agent implementations (edge, synthesizer, boundary, graph, review)
+- **`llm.py`** - LLM client abstraction with retry logic and context management
+- **`budgeting.py`** - Token allocation strategies for fitting large contexts
+
+## Execution model
+
+### Experiment units
+
+The pipeline operates on **experiment units** defined by the Cartesian product:
+
+```
+Experiment Units = Repos × Cycles × Modes
+```
+
+Each unit represents:
+- A repository checkout
+- A specific cycle ID from the baseline
+- An agent configuration mode (orchestrator + variants)
+
+```python
+# From atd_pipeline/runner.py:227-239
+@dataclass(frozen=True)
+class ExperimentUnitRun:
+    pipeline_config: Any
+    repo_spec: Any
+    cycle_spec: Any
+    mode_spec: Any
+    
+    repo_checkout_dir: Path
+    branch_results_dir: Path
+    refactor_branch: str
+    
+    unit_info: ExperimentUnitInfo
+    execution_id: str
+```
+
+### Phase execution pattern
+
+Each phase follows a consistent pattern in `runner.py:254-402`:
+
+1. **Input validation** - Check required artifacts from previous phases
+2. **Command construction** - Build subprocess command with environment
+3. **Execution** - Run subprocess with timeout and error handling
+4. **Output validation** - Verify expected artifacts were created
+5. **Status recording** - Write structured JSON status file
+
+<Note>
+  The framework supports **resumption**: completed phases are skipped if their inputs/outputs still validate.
+</Note>
+
+### LLM unavailability handling
+
+The pipeline implements fail-fast behavior when the LLM becomes unavailable:
+
+```python
+# From atd_pipeline/runner.py:250-251
+# Convention: tools that cannot reach the LLM should exit 42.
+LLM_BLOCKED_EXIT_CODE = 42
+```
+
+When exit code 42 is detected, the pipeline:
+- Marks the unit as `blocked` with reason `llm_unavailable`
+- Optionally stops processing remaining units (if `stop_on_llm_blocked=True`)
+- Allows downstream phases to skip blocked units gracefully
+
+## Configuration system
+
+The `atd_pipeline/config.py` module defines the configuration schema:
+
+```yaml
+# Example configuration structure
+experiment_id: "exp_2024_01"
+projects_dir: "./projects"
+repos_file: "repos.txt"
+cycles_file: "cycles.txt"
+results_root: "./results"
+
+llm:
+  base_url: "http://localhost:8012/v1"
+  model_raw: "claude-4.5-sonnet"
+  context_length: 200000
+  api_key: "sk-..."
+
+openhands:
+  runtime_image: "python:3.11"
+  max_iters: 50
+  commit_message: "Refactor: resolve architectural dependency cycle"
+
+modes:
+  - id: "multi_agent_E0_S0"
+    params:
+      orchestrator: "multi_agent"
+      edge_variant: "E0"
+      synthesizer_variant: "S0"
+      auxiliary_agent: "none"
+```
+
+## Data artifacts
+
+Key artifacts produced at each stage:
+
+| Phase | Artifact | Location | Description |
+|-------|----------|----------|-------------|
+| Baseline | `dependency_graph.json` | `{results}/{repo}/branches/{branch}/` | Full dependency graph |
+| Baseline | `scc_report.json` | `{results}/{repo}/branches/{branch}/ATD_identification/` | SCC metrics + PageRank |
+| Cycle Selection | `cycle_catalog.json` | `{results}/{repo}/branches/{branch}/ATD_identification/` | Sampled cycles |
+| Explain | `prompt.txt` | `{results}/{repo}/branches/{refactor_branch}/explain/` | Generated explanation |
+| Refactoring | `status.json` | `{results}/{repo}/branches/{refactor_branch}/openhands/` | Refactoring outcome |
+| Metrics | `branch_metrics.json` | `{results}/{repo}/branches/{refactor_branch}/` | Post-refactoring metrics |
+
+<Tip>
+  Each phase writes a `status_{phase}.json` file with structured metadata including timestamps, return codes, and artifacts.
+</Tip>
+
+## Extensibility points
+
+The architecture supports extension through:
+
+1. **Agent variants** - Different prompt strategies (E0/E1/E2 for edges, S0/S1/S2 for synthesis)
+2. **Auxiliary agents** - Optional context providers (boundary, graph, review)
+3. **Orchestrator modes** - Minimal vs. multi-agent orchestration
+4. **Language support** - Language-specific dependency extractors and semantics
+
+See [Agents](/concepts/agents) for details on the multi-agent system implementation.

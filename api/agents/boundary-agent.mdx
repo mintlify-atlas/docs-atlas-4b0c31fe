@@ -1,0 +1,251 @@
+---
+title: Boundary agent
+description: Infers architectural boundaries from file paths and naming conventions
+---
+
+The boundary agent uses heuristics based on file paths, folder structure, and naming conventions to infer likely architectural boundaries within a codebase.
+
+## Overview
+
+The boundary agent:
+
+- Analyzes external connections (incoming/outgoing) for each file in a cycle
+- Groups files by folder buckets to identify architectural patterns
+- Detects likely boundaries (e.g., domain layers, feature modules)
+- Identifies possible boundary violations
+- Operates on file paths only (no code analysis)
+- Uses cautious interpretation to avoid framework assumptions
+
+Output is typically used as auxiliary context for the [synthesizer agent](/api/agents/synthesizer-agent).
+
+## Function signature
+
+```python
+def run_boundary_agent(
+    *,
+    client: LLMClient,
+    transcript_path: str,
+    language: str,
+    cycle_nodes: List[str],
+    scc_edges: List[SCCEdge],
+) -> str
+```
+
+Location: `explain_AS/agents/boundary.py:235`
+
+## Parameters
+
+<ParamField path="client" type="LLMClient" required>
+  The LLM client instance for making API calls
+</ParamField>
+
+<ParamField path="transcript_path" type="str" required>
+  Path to the transcript file where conversation history is logged
+</ParamField>
+
+<ParamField path="language" type="str" required>
+  Programming language of the codebase (e.g., "Python", "TypeScript")
+</ParamField>
+
+<ParamField path="cycle_nodes" type="List[str]" required>
+  List of file paths forming the dependency cycle
+</ParamField>
+
+<ParamField path="scc_edges" type="List[SCCEdge]" required>
+  List of all edges in the strongly connected component (SCC)
+</ParamField>
+
+## Return value
+
+<ResponseField name="report" type="str">
+  A structured report with the following sections:
+  - **Likely boundaries**: Inferred architectural boundaries based on paths
+  - **Possible boundary violations (if any)**: Cases where cycle crosses boundaries
+  - **Notes / uncertainty**: Caveats and limitations of the heuristic analysis
+</ResponseField>
+
+## SCCEdge data class
+
+```python
+@dataclass(frozen=True)
+class SCCEdge:
+    source: str
+    target: str
+```
+
+Location: `explain_AS/agents/boundary.py:34`
+
+## Configuration constants
+
+<ParamField path="BOUNDARY_MIN_OUTPUT_TOKENS_RESERVED" type="int" default="2000">
+  Token reservation for agent output
+</ParamField>
+
+<ParamField path="BOUNDARY_SAFETY_MARGIN_TOKENS" type="int" default="1000">
+  Safety margin to prevent context overflow
+</ParamField>
+
+<ParamField path="BOUNDARY_MAX_SAMPLES_PER_DIR" type="int" default="8">
+  Maximum file path samples shown per direction (incoming/outgoing)
+</ParamField>
+
+<ParamField path="BOUNDARY_MAX_FOLDER_BUCKETS_PER_DIR" type="int" default="6">
+  Maximum folder bucket summaries per direction
+</ParamField>
+
+<ParamField path="BOUNDARY_FOLDER_BUCKET_DEPTH" type="int" default="2">
+  Folder depth for bucketing (e.g., `src/domain` at depth 2)
+</ParamField>
+
+## Prompt template
+
+The boundary agent uses a fixed prompt preamble:
+
+```python
+BOUNDARY_PROMPT_PREAMBLE = """You are the Boundary Heuristic Agent.
+You infer likely architectural boundaries from file paths and naming only.
+
+Rules:
+- Be cautious: do not assume frameworks.
+- No tables, no JSON.
+- Keep it short and helpful.
+- If you see truncation notes, assume some context may be missing.
+"""
+```
+
+Location: `explain_AS/agents/boundary.py:22`
+
+## External connections analysis
+
+The boundary agent builds a detailed view of external connections for each cycle node:
+
+### Folder bucketing
+
+Files are grouped by folder prefix at configurable depth:
+
+```python
+def _folder_bucket(path: str, *, depth: int) -> str:
+    """
+    Bucket by the first N folder segments (excluding the filename).
+    Example (depth=2):
+      src/domain/user.py -> src/domain
+      user.py -> (root)
+    """
+```
+
+Location: `explain_AS/agents/boundary.py:43`
+
+### Path summarization
+
+External connections are summarized with:
+
+- Total count
+- Top folder buckets (with counts)
+- Sample file paths
+- Omission counts for truncated data
+
+```python
+def _summarize_paths(
+    paths: Sequence[str],
+    *,
+    folder_depth: int,
+    max_folders: int,
+    max_samples: int,
+) -> Tuple[int, List[Tuple[str, int]], List[str], int, int]
+```
+
+Location: `explain_AS/agents/boundary.py:60`
+
+## Prompt building
+
+The `build_boundary_user_prompt` function constructs the agent prompt:
+
+```python
+def build_boundary_user_prompt(
+    *,
+    language: str,
+    cycle_nodes: List[str],
+    scc_edges: List[SCCEdge],
+    context_length: int,
+) -> str
+```
+
+Location: `explain_AS/agents/boundary.py:175`
+
+### Structure
+
+1. **Preamble**: Agent role and rules
+2. **Edge semantics**: Language-specific dependency semantics
+3. **Cycle**: Pretty-printed cycle chain
+4. **External connections**: Per-node incoming/outgoing summaries
+5. **Output format**: Required section headings
+
+## Example usage
+
+<CodeGroup>
+```python Basic usage
+from agents.boundary import SCCEdge, run_boundary_agent
+
+boundary_report = run_boundary_agent(
+    client=llm_client,
+    transcript_path="/tmp/transcript.jsonl",
+    language="Python",
+    cycle_nodes=[
+        "src/domain/user.py",
+        "src/handlers/user_handler.py",
+        "src/database/models.py",
+    ],
+    scc_edges=[
+        SCCEdge("src/domain/user.py", "src/database/models.py"),
+        SCCEdge("src/database/models.py", "src/handlers/user_handler.py"),
+        SCCEdge("src/handlers/user_handler.py", "src/domain/user.py"),
+        SCCEdge("src/domain/user.py", "src/utils/validation.py"),
+        # ... more edges
+    ],
+)
+```
+
+```python TypeScript example
+boundary_report = run_boundary_agent(
+    client=llm_client,
+    transcript_path="/tmp/transcript.jsonl",
+    language="TypeScript",
+    cycle_nodes=[
+        "src/features/auth/service.ts",
+        "src/features/user/model.ts",
+        "src/features/auth/middleware.ts",
+    ],
+    scc_edges=scc_edge_list,
+)
+```
+</CodeGroup>
+
+## Example output structure
+
+For each cycle node, the external connections block shows:
+
+```
+src/domain/user.py
+- Outgoing outside-cycle: 3 total
+  - By folder: src/utils (2), src/database (1)
+  - Samples:
+    - src/utils/validation.py
+    - src/utils/formatting.py
+    - src/database/connection.py
+- Incoming outside-cycle: 5 total
+  - By folder: src/handlers (3), src/api (2)
+  - Samples:
+    - src/handlers/user_handler.py
+    - src/handlers/admin_handler.py
+    - src/api/routes.py
+    - ... +2 more
+```
+
+<Note>
+The boundary agent operates purely on file paths and folder structure. It does not analyze code content, making it fast and suitable for large codebases.
+</Note>
+
+## Related agents
+
+- [Graph agent](/api/agents/graph-agent) - Provides SCC structural context
+- [Synthesizer agent](/api/agents/synthesizer-agent) - Consumes boundary insights as auxiliary context

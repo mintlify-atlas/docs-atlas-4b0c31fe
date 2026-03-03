@@ -1,0 +1,273 @@
+---
+title: Review agent
+description: Finalizes and refines synthesizer output for clarity and consistency
+---
+
+The review agent acts as a finalizer that rewrites the [synthesizer agent](/api/agents/synthesizer-agent) output to improve clarity and internal consistency.
+
+## Overview
+
+The review agent:
+
+- Rewrites synthesizer output for clarity and consistency
+- Does NOT add new facts beyond the evidence provided
+- Removes contradictions and unclear statements
+- Ensures all claims are grounded in edge reports and auxiliary context
+- Outputs only the final revised explanation (no meta-commentary)
+- Prioritizes synthesizer text in token budget allocation
+
+This is the final stage in the explanation pipeline.
+
+## Function signature
+
+```python
+def run_review_agent(
+    *,
+    client: LLMClient,
+    transcript_path: str,
+    language: str,
+    cycle_nodes: List[str],
+    edge_reports: Sequence[str],
+    synthesizer_text: str,
+    aux_context: str = "",
+) -> str
+```
+
+Location: `explain_AS/agents/review.py:131`
+
+## Parameters
+
+<ParamField path="client" type="LLMClient" required>
+  The LLM client instance for making API calls
+</ParamField>
+
+<ParamField path="transcript_path" type="str" required>
+  Path to the transcript file where conversation history is logged
+</ParamField>
+
+<ParamField path="language" type="str" required>
+  Programming language of the codebase (e.g., "Python", "TypeScript")
+</ParamField>
+
+<ParamField path="cycle_nodes" type="List[str]" required>
+  List of file paths forming the dependency cycle
+</ParamField>
+
+<ParamField path="edge_reports" type="Sequence[str]" required>
+  List of edge reports (same as provided to synthesizer)
+</ParamField>
+
+<ParamField path="synthesizer_text" type="str" required>
+  The output from the synthesizer agent to be refined
+</ParamField>
+
+<ParamField path="aux_context" type="str" default="">
+  Optional auxiliary context (boundary/graph reports)
+</ParamField>
+
+## Return value
+
+<ResponseField name="explanation" type="str">
+  A refined, consistent cycle explanation with the following sections:
+  - **Cycle summary**: Concise overview of the cycle
+  - **How the cycle is formed**: Explanation of edge connections
+  - **Why this coupling exists (cautious interpretation)**: Inferred reasons
+  - **Impact / maintainability notes**: Effects on codebase health
+  - **Reminders / constraints**: Important caveats and limitations
+</ResponseField>
+
+## Configuration constants
+
+<ParamField path="REVIEW_MIN_OUTPUT_TOKENS_RESERVED" type="int" default="3667">
+  Token reservation for agent output (approximately 11,000 characters)
+</ParamField>
+
+<ParamField path="REVIEW_SAFETY_MARGIN_TOKENS" type="int" default="1000">
+  Safety margin to prevent context overflow
+</ParamField>
+
+## Prompt template
+
+The review agent uses a fixed prompt preamble with strict rules:
+
+```python
+REVIEW_PROMPT_PREAMBLE = """You are the Reviewer Agent.
+You are a finalizer: rewrite the synthesizer output to be clearer and internally consistent.
+
+Hard rules:
+- Do NOT add new facts.
+- Do NOT include meta commentary, critiques, or headings like "Issues found" or "Suggested revisions".
+- Output ONLY the final revised cycle explanation, in the requested output format.
+- No tables, no JSON.
+- If you see truncation notes, assume some context may be missing.
+"""
+```
+
+Location: `explain_AS/agents/review.py:19`
+
+<Note>
+The review agent is explicitly prohibited from adding new facts, making critiques, or including meta-commentary. It only rewrites what the synthesizer produced.
+</Note>
+
+## Prompt building
+
+The `build_review_user_prompt` function constructs the agent prompt:
+
+```python
+def build_review_user_prompt(
+    *,
+    language: str,
+    cycle_nodes: List[str],
+    synthesizer_text: str,
+    edge_reports: Sequence[str],
+    aux_context: str,
+    context_length: int,
+) -> str
+```
+
+Location: `explain_AS/agents/review.py:31`
+
+### Token allocation logic
+
+The review agent uses a two-tier priority system:
+
+1. **Priority 1 (Synthesizer output)**: Allocate as much as possible
+   - Calculate tokens needed for synthesizer text
+   - Allocate up to full budget if needed
+   - Truncate only if absolutely necessary
+
+2. **Priority 2 (Evidence)**: Share remaining budget
+   - Edge reports and auxiliary context share leftover budget
+   - Use `allocate_token_budgets_even_share_with_redistribution`
+   - Each evidence item gets fair share with redistribution
+
+```python
+# Priority allocation
+synthesizer_tokens_allocated = min(synthesizer_tokens_needed, total_budget)
+remaining_tokens_for_evidence = total_budget - synthesizer_tokens_allocated
+
+# Evidence items share remaining budget
+evidence_items = edge_reports + [aux_context]
+evidence_allocations = allocate_token_budgets_even_share_with_redistribution(
+    item_token_needs=evidence_needs,
+    total_tokens=remaining_tokens_for_evidence,
+)
+```
+
+Location: `explain_AS/agents/review.py:81`
+
+<Note>
+The review agent prioritizes synthesizer output because that's the primary text being refined. Edge reports and auxiliary context serve as supporting evidence.
+</Note>
+
+## Example usage
+
+<CodeGroup>
+```python Basic usage
+from agents.review import run_review_agent
+
+final_explanation = run_review_agent(
+    client=llm_client,
+    transcript_path="/tmp/transcript.jsonl",
+    language="Python",
+    cycle_nodes=[
+        "src/domain/user.py",
+        "src/handlers/user_handler.py",
+        "src/database/models.py",
+    ],
+    edge_reports=[
+        "Edge: domain/user.py -> database/models.py\n...",
+        "Edge: database/models.py -> handlers/user_handler.py\n...",
+        "Edge: handlers/user_handler.py -> domain/user.py\n...",
+    ],
+    synthesizer_text="Cycle summary: This cycle involves...\n",
+)
+```
+
+```python With auxiliary context
+final_explanation = run_review_agent(
+    client=llm_client,
+    transcript_path="/tmp/transcript.jsonl",
+    language="TypeScript",
+    cycle_nodes=cycle_files,
+    edge_reports=edge_reports_list,
+    synthesizer_text=synthesizer_output,
+    aux_context=boundary_report + "\n\n" + graph_report,
+)
+```
+
+```python Full pipeline
+# Step 1: Edge analysis
+edge_reports = [
+    run_edge_agent(..., edge=edge_1),
+    run_edge_agent(..., edge=edge_2),
+    run_edge_agent(..., edge=edge_3),
+]
+
+# Step 2: Auxiliary context
+boundary_report = run_boundary_agent(...)
+graph_report = run_graph_agent(...)
+aux_context = boundary_report + "\n\n" + graph_report
+
+# Step 3: Synthesis
+synthesizer_output = run_synthesizer_agent(
+    edge_reports=edge_reports,
+    aux_context=aux_context,
+)
+
+# Step 4: Review (final)
+final_explanation = run_review_agent(
+    edge_reports=edge_reports,
+    synthesizer_text=synthesizer_output,
+    aux_context=aux_context,
+)
+```
+</CodeGroup>
+
+## Prompt structure
+
+The review prompt includes:
+
+1. **Preamble**: Agent role and hard rules
+2. **Edge semantics**: Language-specific dependency semantics
+3. **Cycle**: Pretty-printed cycle chain
+4. **Synthesizer output**: Primary text to refine (high priority)
+5. **Evidence separator**: Clearly marks supporting evidence section
+6. **Edge reports**: Token-budgeted edge reports
+7. **Auxiliary context**: Token-budgeted boundary/graph insights
+8. **Output format**: Required section headings
+
+## What the review agent does
+
+### Improves clarity
+
+- Simplifies complex sentences
+- Removes redundancy
+- Clarifies ambiguous statements
+- Ensures consistent terminology
+
+### Ensures consistency
+
+- Checks claims against edge reports
+- Removes contradictions
+- Aligns statements with evidence
+- Maintains factual accuracy
+
+### Does NOT do
+
+- Add new facts not in evidence
+- Make critiques or suggestions
+- Include meta-commentary like "Issues found:"
+- Propose refactorings beyond what synthesizer suggested
+- Analyze code (only rewrites text)
+
+<Note>
+The review agent outputs ONLY the final revised explanation. It does not include a "before and after" comparison or list of changes made.
+</Note>
+
+## Related agents
+
+- [Synthesizer agent](/api/agents/synthesizer-agent) - Produces the initial explanation refined by this agent
+- [Edge agent](/api/agents/edge-agent) - Provides edge reports used as evidence
+- [Boundary agent](/api/agents/boundary-agent) - Provides architectural context
+- [Graph agent](/api/agents/graph-agent) - Provides structural context

@@ -1,0 +1,455 @@
+---
+title: Pipeline phases
+description: Detailed breakdown of the five main pipeline phases from baseline to metrics collection
+---
+
+The ATD pipeline executes five sequential phases, each producing artifacts consumed by subsequent stages.
+
+## Phase 1: Baseline collection
+
+**Command:** `atd_pipeline baseline`
+
+**Purpose:** Extract dependency graphs and identify architectural debt in the baseline branch.
+
+### Process
+
+<Steps>
+  <Step title="Checkout baseline branch">
+    Ensure repository is on the configured base branch (e.g., `main`, `master`)
+  </Step>
+  <Step title="Build dependency graph">
+    Execute language-specific extractors to produce `dependency_graph.json`
+  </Step>
+  <Step title="Extract SCCs">
+    Run `ATD_identification/extract_sccs.py` to identify strongly connected components
+  </Step>
+  <Step title="Compute PageRank">
+    Calculate node centrality scores on the full dependency graph
+  </Step>
+</Steps>
+
+### Implementation
+
+From `atd_pipeline/cli.py:356-423`:
+
+```python
+@app.command()
+def baseline(
+    config: Path = typer.Option(..., "-c", "--config", exists=True, dir_okay=False),
+):
+    pipeline_config = load_pipeline_config(config)
+    repo_specs = read_repos(pipeline_config.repos_file)
+
+    for repo_spec in repo_specs:
+        repo_checkout_dir = (pipeline_config.projects_dir / repo_spec.repo).resolve()
+        baseline_branch = repo_spec.base_branch
+        branch_results_dir = results_dir_for_branch(
+            pipeline_config.results_root, repo_spec.repo, baseline_branch
+        )
+        
+        command = list(BASELINE_COLLECT_COMMAND) + [
+            str(repo_checkout_dir),
+            baseline_branch,
+            repo_spec.entry,
+            str(branch_results_dir),
+            repo_spec.language,
+        ]
+        
+        rc = run_subprocess_command(command, cwd=REPO_ROOT_DIR)
+```
+
+### Outputs
+
+- **`dependency_graph.json`** - Full dependency graph with nodes and edges
+- **`scc_report.json`** - Strongly connected components with metrics:
+  - SCC size, edge count, density
+  - Edge surplus (lower bound on edges to remove)
+  - Total lines of code per SCC
+  - Global PageRank scores in `node_features`
+
+<Info>
+  PageRank is computed on the **entire dependency graph**, not just individual SCCs, to capture global importance.
+</Info>
+
+### SCC extraction algorithm
+
+From `ATD_identification/extract_sccs.py:101-148`:
+
+```python
+# SCCs (cyclic only)
+scc_sets = [set(s) for s in nx.strongly_connected_components(G) if len(s) > 1]
+scc_sets.sort(key=lambda s: (len(s), sorted(s)), reverse=True)
+
+for idx, scc in enumerate(scc_sets):
+    sub = G.subgraph(scc).copy()
+    n = sub.number_of_nodes()
+    m = sub.number_of_edges()
+    
+    dens = m / (n * (n - 1)) if n > 1 else 0.0
+    surplus = edge_surplus_lb_undirected(sub)
+    
+    report_sccs.append({
+        "id": f"scc_{idx}",
+        "size": n,
+        "edge_count": m,
+        "density_directed": round(dens, 6),
+        "edge_surplus_lb": surplus,
+        "nodes": [...],
+        "edges": scc_edge_objects(sub, relation),
+    })
+```
+
+## Phase 2: Cycle selection
+
+**Command:** Executed as part of baseline collection
+
+**Purpose:** Sample representative cycles from SCCs for explanation and refactoring.
+
+### Sampling strategy
+
+From `ATD_identification/pick_cycles.py:117-172`:
+
+```python
+def _sample_cycles_in_scc(
+    Gscc: nx.DiGraph,
+    *,
+    max_len: int,
+    attempts: int,
+    rng: random.Random,
+) -> List[List[str]]:
+    """
+    Find cycles by repeated bounded random walks:
+      - pick start node
+      - walk up to max_len, stop if we return to a node already on the path
+      - if that closes a cycle back to the repeated node -> record that cycle
+    This is not complete enumeration; it's a fast sampler.
+    """
+```
+
+<Accordion title="Why not enumerate all cycles?">
+  Full cycle enumeration is computationally intractable for large SCCs. The pipeline uses **random walk sampling** with:
+  - Configurable max cycle length (default: 8)
+  - Configurable attempts per SCC (default: 5000)
+  - PageRank-weighted prioritization of high-impact cycles
+</Accordion>
+
+### Edge-disjoint packing
+
+From `ATD_identification/pick_cycles.py:178-217`:
+
+```python
+def _pack_edge_disjoint_cycles(
+    cycles: List[List[str]],
+    pr: Dict[str, float],
+    *,
+    max_keep: int,
+) -> List[List[str]]:
+    """
+    Greedy packing to enforce pairwise edge-disjointness among returned cycles.
+    
+    - Sort candidates by (length desc, avg_pagerank desc, lexical tie-break)
+    - Accept a cycle iff none of its directed edges have been used
+    - Stop once we have max_keep (if max_keep > 0)
+    """
+    used_edges: Set[Tuple[str, str]] = set()
+    kept: List[List[str]] = []
+    
+    for cyc in ordered:
+        edges = cycle_edge_tuples(cyc)
+        if any(e in used_edges for e in edges):
+            continue
+        kept.append(cyc)
+        used_edges.update(edges)
+```
+
+<Note>
+  **Edge-disjoint cycles** ensure each dependency edge appears in at most one selected cycle, avoiding overlapping refactoring efforts.
+</Note>
+
+### Outputs
+
+- **`cycle_catalog.json`** - Selected cycles with metadata:
+  - Cycle ID (format: `scc_{idx}_cycle_{j}`)
+  - Cycle length and node sequence
+  - Directed edges forming the cycle
+  - PageRank metrics (min, max, avg)
+
+## Phase 3: Explain
+
+**Command:** `atd_pipeline explain`
+
+**Purpose:** Generate architectural explanations for selected cycles using the multi-agent system.
+
+### Execution flow
+
+From `atd_pipeline/cli.py:166-232`:
+
+```python
+def run_explain_phase(pipeline_config: PipelineConfig, experiment_units: list):
+    def validate_unit_inputs(unit_run):
+        scc_report_path = scc_report_path_for_unit_run(pipeline_config, unit_run)
+        catalog_path = cycle_catalog_path_for_unit_run(pipeline_config, unit_run)
+        
+        missing: List[str] = []
+        if not scc_report_path.exists():
+            missing.append(str(scc_report_path))
+        if not catalog_path.exists():
+            missing.append(str(catalog_path))
+        
+        if missing:
+            return ("failed", "missing baseline artifacts: " + ", ".join(missing), {})
+        return ("ok", "", {})
+    
+    def build_unit_command(unit_run) -> List[str]:
+        return [
+            "python3",
+            str(CYCLE_EXPLAINER_SCRIPT),
+            "--repo-root", str(unit_run.repo_checkout_dir),
+            "--src-root", str(repo_spec.entry),
+            "--scc-report", str(scc_report_path),
+            "--cycle-catalog", str(cycle_catalog_path),
+            "--cycle-id", cycle_spec.cycle_id,
+            "--out-prompt", str(prompt_output_path),
+        ]
+```
+
+### Mode configuration
+
+The `mode_spec.params` dictionary controls agent behavior:
+
+```python
+# From atd_pipeline/config.py:173-213
+def _validate_and_normalize_mode_params(params: Dict[str, Any], *, where: str):
+    orchestrator = str(out.get("orchestrator") or "multi_agent").strip()
+    if orchestrator not in {"minimal", "multi_agent"}:
+        _die(f"{where}.orchestrator must be 'minimal' or 'multi_agent'")
+    
+    aux = str(out.get("auxiliary_agent") or "none").strip()
+    if aux not in {"none", "boundary", "graph", "review"}:
+        _die(f"{where}.auxiliary_agent must be one of none|boundary|graph|review")
+    
+    if orchestrator != "minimal":
+        edge_variant = str(out.get("edge_variant") or "E0").strip()
+        synthesizer_variant = str(out.get("synthesizer_variant") or "S0").strip()
+```
+
+### Multi-agent orchestration
+
+From `explain_AS/engine.py:96-208`:
+
+```python
+def _run_multi_agent(
+    *,
+    client: LLMClient,
+    transcript_path: str,
+    repo_root: str,
+    language: str,
+    cycle: Dict[str, Any],
+    scc_report: Dict[str, Any],
+    params: Dict[str, Any],
+) -> ExplainEngineResult:
+    # 1. Run edge agents for each cycle edge
+    edge_reports: List[str] = []
+    for edge in filtered_edges:
+        report = run_edge_agent(
+            client=client,
+            language=language,
+            cycle_nodes=cycle_nodes,
+            edge=edge,
+            files_by_node=files_by_node,
+        )
+        edge_reports.append(report)
+    
+    # 2. Optional auxiliary context (boundary/graph)
+    aux_context = ""
+    if auxiliary_agent == "boundary":
+        boundary_text = run_boundary_agent(...)
+        aux_context = "=== Boundary heuristic agent ===\n" + boundary_text
+    
+    # 3. Synthesize cycle-level explanation
+    synthesizer_text = run_synthesizer_agent(
+        cycle_nodes=cycle_nodes,
+        edge_reports=edge_reports,
+        aux_context=aux_context,
+    )
+    
+    # 4. Optional review for consistency
+    if auxiliary_agent == "review":
+        synthesizer_text = run_review_agent(
+            synthesizer_text=synthesizer_text,
+            edge_reports=edge_reports,
+        )
+    
+    # 5. Combine minimal prompt + final explanation
+    final_prompt = minimal_prompt + "\n\n" + synthesizer_text
+```
+
+<Tip>
+  See [Agents](/concepts/agents) for detailed documentation of each agent's role and implementation.
+</Tip>
+
+### Outputs
+
+- **`prompt.txt`** - Final architectural explanation combining:
+  - Minimal base prompt with cycle structure
+  - Synthesized cycle-level explanation
+  - (Edge reports and auxiliary outputs are NOT included in the final prompt)
+
+## Phase 4: Refactoring (OpenHands)
+
+**Command:** `atd_pipeline openhands`
+
+**Purpose:** Apply automated refactoring using the OpenHands agent based on cycle explanations.
+
+### Execution
+
+From `atd_pipeline/cli.py:235-298`:
+
+```python
+def run_openhands_phase(pipeline_config: PipelineConfig, experiment_units: list):
+    def validate_unit_inputs(unit_run):
+        prompt_output_path = prompt_text_path_for_unit_run(unit_run)
+        if not prompt_output_path.exists() or prompt_output_path.stat().st_size == 0:
+            return ("skipped", "skipped_missing_explain_prompt", {})
+        return ("ok", "", {})
+    
+    def build_unit_command(unit_run) -> List[str]:
+        return [
+            "bash",
+            str(OPENHANDS_WRAPPER_SCRIPT),
+            str(unit_run.repo_checkout_dir),
+            unit_run.repo_spec.base_branch,
+            unit_run.refactor_branch,
+            str(prompt_output_path),
+            str(out_dir),
+        ]
+```
+
+### Outcome handling
+
+From `atd_pipeline/cli.py:262-286`:
+
+```python
+def validate_unit_outputs(unit_run):
+    status = read_json(status_path)
+    oh_outcome = str(status.get("outcome", "")).strip()
+    oh_reason = str(status.get("reason", "")).strip()
+    
+    if oh_outcome in {"committed", "no_changes"}:
+        return ("ok", f"openhands_{oh_outcome}", artifacts)
+    
+    if oh_outcome == "blocked":
+        if oh_reason == "llm_unavailable":
+            return ("blocked", "llm_unavailable", artifacts)
+        return ("blocked", f"openhands_blocked_{oh_reason or 'unknown'}", artifacts)
+    
+    return ("failed", f"openhands failed: {oh_outcome}", artifacts)
+```
+
+<Info>
+  OpenHands creates a refactor branch with naming pattern: `atd-{experiment_id}-{mode_id}-{cycle_id}`
+</Info>
+
+### Outputs
+
+- **`status.json`** - Refactoring outcome:
+  - `outcome`: `committed` | `no_changes` | `blocked` | `failed`
+  - `reason`: Detailed reason string
+  - Execution metadata (iterations, duration)
+- **Git branch** - Refactor branch with committed changes (if successful)
+
+## Phase 5: Metrics collection
+
+**Command:** `atd_pipeline metrics`
+
+**Purpose:** Measure the impact of refactoring on code quality and architecture.
+
+### Execution
+
+From `atd_pipeline/cli.py:301-353`:
+
+```python
+def run_metrics_phase(pipeline_config: PipelineConfig, experiment_units: list):
+    def validate_unit_inputs(unit_run):
+        status = read_json(status_path)
+        if str(status.get("outcome", "")).strip() != "committed":
+            return ("skipped", f"skipped_openhands_outcome_{status.get('outcome')}", {})
+        return ("ok", "", {})
+    
+    def build_unit_command(unit_run) -> List[str]:
+        return list(BRANCH_METRICS_COMMAND) + [
+            str(unit_run.repo_checkout_dir),
+            unit_run.refactor_branch,
+            repo_spec.entry,
+            str(unit_run.branch_results_dir),
+            repo_spec.base_branch,
+            repo_spec.language,
+        ]
+```
+
+### Branch cleanup
+
+From `atd_pipeline/runner.py:142-176`:
+
+```python
+def maybe_delete_refactor_branch(
+    *,
+    enabled: bool,
+    repo_dir: Path,
+    experiment_id: str,
+    base_branch: str,
+    refactor_branch: str,
+) -> None:
+    if not enabled:
+        return
+    
+    prefix = f"atd-{experiment_id}-"
+    if not refactor_branch.startswith(prefix):
+        return
+    
+    # Checkout base branch, then delete refactor branch
+    _git(repo_dir, ["checkout", "-q", base_branch])
+    _git(repo_dir, ["branch", "-D", refactor_branch])
+```
+
+<Note>
+  Refactor branches can be automatically deleted after metrics collection using the `policy.delete_refactor_branches_after_metrics` config option.
+</Note>
+
+### Outputs
+
+- **`branch_metrics.json`** - Comparative metrics:
+  - Dependency graph changes (nodes, edges, SCCs)
+  - Code quality metrics (complexity, LOC)
+  - Test results (if applicable)
+  - Cycle resolution status
+
+## Phase status tracking
+
+Every phase writes a structured status file at `{results_dir}/status_{phase}.json`:
+
+```json
+{
+  "ts_utc": "2024-03-15T10:30:45Z",
+  "run_id": "20240315_103045_abc123",
+  "phase": "explain",
+  "outcome": "ok",
+  "reason": "",
+  "returncode": 0,
+  "duration_sec": 45.3,
+  "unit": {
+    "repo": "myproject",
+    "base_branch": "main",
+    "branch": "atd-exp01-multi_agent-scc_0_cycle_5",
+    "cycle_id": "scc_0_cycle_5",
+    "mode_id": "multi_agent_E0_S0"
+  },
+  "artifacts": {
+    "prompt": "/results/myproject/branches/.../explain/prompt.txt"
+  }
+}
+```
+
+<Tip>
+  Use `status_{phase}.json` files to monitor pipeline progress and debug failures.
+</Tip>
