@@ -97,8 +97,8 @@
     "CLI: atd_pipeline openhands",
     "CLI: atd_pipeline metrics",
     "CLI: atd_pipeline llm",
-    "Edge Agent Variants: E0, E1",
-    "Synthesizer Variants: S0",
+    "Edge Agent Variants: E0, E1, E2",
+    "Synthesizer Variants: S0, S1, S2",
     "Auxiliary Agents: boundary, graph, review",
     "Orchestrator Modes: minimal, multi_agent"
   ]
